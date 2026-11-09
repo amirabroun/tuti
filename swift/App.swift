@@ -1,3 +1,4 @@
+import ServiceManagement
 import SwiftUI
 
 /// v1 hard-codes where things live; the app launches the Python server from the tuti repo.
@@ -18,56 +19,111 @@ struct TutiApp: App {
     @State private var model = TranscriptViewModel()
 
     var body: some Scene {
-        // one window as the only scene: closing it quits the app, which stops the server and the mic
+        // closing the window hides to the menu bar (it is a scene too); Quit lives there
         Window("Tuti", id: "main") {
             ContentView(model: model)
-                .frame(minWidth: 420, minHeight: 420)
+                .frame(minWidth: 460, minHeight: 440)
                 .onAppear { model.appStart() }
         }
+        MenuBarExtra {
+            MenuBarContent(model: model)
+        } label: {
+            Image(systemName: model.phase == .recording ? "mic.fill" : "waveform")
+        }
+    }
+}
+
+/// The menu-bar dropdown: status, record, recent cards, tokens, login toggle.
+private struct MenuBarContent: View {
+    let model: TranscriptViewModel
+    @Environment(\.openWindow) private var openWindow
+    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+
+    var body: some View {
+        Text(model.statusText)
+        Text("tokens: \(model.tokensIn.formatted()) in · \(model.tokensOut.formatted()) out")
+        Divider()
+        Button(model.phase == .recording ? "Stop" : "Record") { model.uiToggleRecord() }
+            .disabled(model.phase != .ready && model.phase != .recording)
+        Divider()
+        ForEach(model.cards.filter { $0.isFinal }.suffix(5).reversed()) { card in
+            Button(menuTitle(card.text)) { model.copyText(card.text) }
+        }
+        Divider()
+        Toggle("Launch at Login", isOn: Binding(
+            get: { launchAtLogin },
+            set: { on in
+                do {
+                    if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+                    launchAtLogin = on
+                } catch {
+                    model.reportError("Launch at Login failed: \(error.localizedDescription)")
+                }
+            }))
+        Button("Open Tuti") {
+            openWindow(id: "main")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        Divider()
+        Button("Quit Tuti") { NSApp.terminate(nil) }
+            .keyboardShortcut("q")
+    }
+
+    private func menuTitle(_ text: String) -> String {
+        let flat = text.replacingOccurrences(of: "\n", with: " ")
+        return flat.count > 60 ? String(flat.prefix(60)) + "…" : flat
     }
 }
 
 struct ContentView: View {
     let model: TranscriptViewModel
-    @State private var showHistory = false
 
     var body: some View {
         VStack(spacing: 12) {
             HStack {
                 Circle().fill(statusColor).frame(width: 10, height: 10)
-                Text(statusText)
+                Text(model.statusText)
                 Spacer()
                 if model.phase == .recording {
                     Text(String(format: "%.0f dB", model.levelDb)).monospacedDigit()
                 }
-                Picker("Style", selection: Bindable(model).spoken) {
-                    Text("Spoken").tag(true)
-                    Text("Formal").tag(false)
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 120)
-                .controlSize(.mini)
                 Toggle("Auto-stop", isOn: Bindable(model).autoStop).toggleStyle(.checkbox)
-                Button("Re-clean", action: model.reclean).buttonStyle(.borderless)
-                    .disabled(model.cards.last?.text.isEmpty != false)
-                Button("History") { showHistory = true }.buttonStyle(.borderless)
             }
             .font(.callout)
             .foregroundStyle(.secondary)
 
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.tertiary)
+                TextField("Search cards", text: Bindable(model).searchQuery)
+                    .textFieldStyle(.roundedBorder)
+                if !model.searchQuery.isEmpty {
+                    Button {
+                        model.searchQuery = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
+
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 8) {
-                        if model.cards.isEmpty {
-                            Text("Press Record (Space) — click a card to copy it")
+                        if model.visibleCards.isEmpty {
+                            Text(model.searchQuery.isEmpty
+                                 ? "Press Record (Space or ⌥Space) — click a card to copy it"
+                                 : "Nothing matches")
                                 .foregroundStyle(.tertiary)
                         }
-                        ForEach(model.cards) { card in
+                        ForEach(model.visibleCards) { card in
                             CardView(card: card,
                                      isActive: !card.isFinal && card.id == model.cards.last?.id,
                                      partial: card.id == model.cards.last?.id && !card.isFinal
                                         ? model.partial : "",
-                                     cleaning: model.cleaning)
+                                     cleaning: model.cleaning,
+                                     onEdit: model.editCard,
+                                     onDelete: model.deleteCard,
+                                     onRunIntent: model.runIntent)
                                 .id(card.id)
                         }
                     }
@@ -92,26 +148,17 @@ struct ContentView: View {
                 .font(.caption)
             }
 
-            Button(action: model.toggleRecord) {
+            Button(action: model.uiToggleRecord) {
                 Label(model.phase == .recording ? "Stop" : "Record",
                       systemImage: model.phase == .recording ? "stop.circle.fill" : "record.circle")
                     .frame(maxWidth: .infinity)
             }
             .controlSize(.large)
-            .keyboardShortcut(.space, modifiers: [])
+            // Space is handled by a key monitor in the model: a bare-Space button shortcut
+            // also fires while typing in the search/edit fields (macOS SwiftUI quirk)
             .disabled(model.phase != .ready && model.phase != .recording)
         }
         .padding()
-        .sheet(isPresented: $showHistory) { HistoryPanel(model: model) }
-    }
-
-    private var statusText: String {
-        switch model.phase {
-        case .starting: return "Loading the model…"
-        case .ready: return model.copied ? "Ready · copied" : "Ready"
-        case .recording: return "Listening"
-        case .finalizing: return "Finishing…"
-        }
     }
 
     private var statusColor: Color {
@@ -124,15 +171,23 @@ struct ContentView: View {
     }
 }
 
-/// One dictation card: click to copy. The active recording card also shows the live partial
-/// and the AI round-trip (pulsing dot + thin progress bar).
+/// One dictation card: click to copy. Finished cards also carry edit / raw-view / delete
+/// buttons and, when the transcript parsed as a command, an action chip. The active
+/// recording card shows the live partial and the AI round-trip (pulsing dot + progress bar).
 struct CardView: View {
     let card: Card
     let isActive: Bool
     let partial: String
     let cleaning: Bool
+    var onEdit: (UUID, String) -> Void
+    var onDelete: (UUID) -> Void
+    var onRunIntent: (UUID) -> Void
+
     @State private var copied = false
     @State private var pulse = false
+    @State private var editing = false
+    @State private var draft = ""
+    @State private var showRaw = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -146,10 +201,32 @@ struct CardView: View {
                     Text("در حال ویرایش…").font(.caption2).foregroundStyle(.orange)
                 }
                 Spacer(minLength: 0)
+                if card.isFinal { controls }
                 Text(copied ? "copied ✓" : card.ts).font(.caption2).foregroundStyle(.secondary)
             }
-            if !card.text.isEmpty {
-                Text(card.text).multilineTextAlignment(.leading)
+            if editing {
+                TextField("text", text: $draft, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { commitEdit() }
+                HStack {
+                    Button("Save") { commitEdit() }
+                    Button("Cancel") { editing = false }
+                }
+                .controlSize(.small)
+            } else if !display.isEmpty {
+                Text(display).multilineTextAlignment(.leading)
+            }
+            if card.isFinal, let action = card.intent {
+                if card.intentDone {
+                    Label("انجام شد", systemImage: "checkmark.circle.fill")
+                        .font(.caption).foregroundStyle(.green)
+                } else {
+                    Button { onRunIntent(card.id) } label: {
+                        Label(action.label, systemImage: action.icon).font(.caption)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
             }
             if isActive {
                 if !partial.isEmpty {
@@ -170,64 +247,39 @@ struct CardView: View {
         .contentShape(.rect)
         .onTapGesture {
             NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(card.text, forType: .string)
+            NSPasteboard.general.setString(display, forType: .string)
             copied = true
             Task { try? await Task.sleep(for: .seconds(1.2)); copied = false }
         }
     }
-}
 
-/// Message history: every resolved segment, newest first; click a row to copy it.
-struct HistoryPanel: View {
-    let model: TranscriptViewModel
-    @State private var entries: [HistoryEntry] = []
-    @State private var search = ""
-    @State private var confirmClear = false
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        VStack(spacing: 8) {
-            HStack {
-                Text("History").font(.headline)
-                Spacer()
-                Button("Clear") { confirmClear = true }
-                    .disabled(entries.isEmpty)
-                Button("Done") { dismiss() }
-            }
-            TextField("Search", text: $search)
-                .textFieldStyle(.roundedBorder)
-            List(filtered.reversed()) { entry in
-                Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(entry.clean ?? entry.raw, forType: .string)
-                } label: {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(entry.ts).font(.caption).foregroundStyle(.secondary)
-                        Text(entry.clean ?? entry.raw)
-                            .foregroundStyle(entry.clean == nil ? .secondary : .primary)
-                            .multilineTextAlignment(.trailing)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-                }
-                .buttonStyle(.plain)
-            }
-            .listStyle(.plain)
-            .environment(\.layoutDirection, .rightToLeft)  // Persian rows: leading edge is the right
-        }
-        .padding()
-        .frame(minWidth: 380, minHeight: 320)
-        .onAppear { entries = model.loadHistory() }
-        .confirmationDialog("Delete the whole history?", isPresented: $confirmClear, titleVisibility: .visible) {
-            Button("Delete", role: .destructive) {
-                model.clearHistory()
-                entries = []
-            }
-        }
+    /// The «خام» before/after flip: the original ASR text when there is one to compare.
+    private var display: String {
+        if showRaw, let raw = card.raw, !raw.isEmpty { return raw }
+        return card.text
     }
 
-    private var filtered: [HistoryEntry] {
-        let q = search.trimmingCharacters(in: .whitespaces)
-        guard !q.isEmpty else { return entries }
-        return entries.filter { [$0.ts, $0.raw, $0.clean ?? ""].contains { $0.localizedStandardContains(q) } }
+    private var controls: some View {
+        HStack(spacing: 2) {
+            Button { draft = card.text; editing = true } label: {
+                Image(systemName: "pencil")
+            }
+            if let raw = card.raw, !raw.isEmpty, raw != card.text {
+                Button { showRaw.toggle() } label: {
+                    Text(showRaw ? "ویراست" : "خام")
+                }
+            }
+            Button { onDelete(card.id) } label: {
+                Image(systemName: "trash")
+            }
+        }
+        .buttonStyle(.borderless)
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+    }
+
+    private func commitEdit() {
+        editing = false
+        onEdit(card.id, draft)
     }
 }

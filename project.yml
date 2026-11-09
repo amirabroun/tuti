@@ -17,6 +17,7 @@ targets:
       properties:
         CFBundleDisplayName: Tuti
         NSMicrophoneUsageDescription: Tuti turns your speech into live text on this Mac.
+        NSAppleEventsUsageDescription: Tuti creates Reminders from voice commands.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.amirabroun.tuti
