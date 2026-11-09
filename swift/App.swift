@@ -46,7 +46,7 @@ private struct MenuBarContent: View {
         Button(model.phase == .recording ? "Stop" : "Record") { model.uiToggleRecord() }
             .disabled(model.phase != .ready && model.phase != .recording)
         Divider()
-        ForEach(model.cards.suffix(5).reversed()) { card in
+        ForEach(model.cards.filter { $0.isFinal }.suffix(5).reversed()) { card in
             Button(menuTitle(card.text)) { model.copyText(card.text) }
         }
         Divider()
@@ -154,7 +154,8 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity)
             }
             .controlSize(.large)
-            .keyboardShortcut(.space, modifiers: [])
+            // Space is handled by a key monitor in the model: a bare-Space button shortcut
+            // also fires while typing in the search/edit fields (macOS SwiftUI quirk)
             .disabled(model.phase != .ready && model.phase != .recording)
         }
         .padding()

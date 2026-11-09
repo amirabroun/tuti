@@ -142,9 +142,13 @@ class LiveSession:
 
     def _clean_worker(self) -> None:
         """Cleans queued items one at a time, in order: every delta is cleaned with the locked
-        text before it as context and appended to it; nothing is ever sent twice."""
+        text before it as context and appended to it; nothing is ever sent twice. A None item
+        ends the worker so the finished session (its ~4 MB buffer) is actually freed."""
         while True:
-            text, final = self.clean_q.get()
+            item = self.clean_q.get()
+            if item is None:
+                return
+            text, final = item
             self.emit("clean_state", "on")
             cleaned, usage = llm_clean.clean(text, context=self.cleaned or None)
             if not cleaned:
@@ -250,6 +254,7 @@ class LiveSession:
                     self.emit("asr_final", self.streamer.text)
                     self._finish_recording()
                 self.done.set()
+                self.clean_q.put(None)  # the sentinel is last: queued cleans land before it
 
 
 async def _sender(ws, queue: asyncio.Queue) -> None:

@@ -18,6 +18,7 @@ import json
 import os
 import time
 import urllib.request
+from datetime import datetime
 
 TIMEOUT = 15  # s; a clean that never returns must not pile up
 
@@ -100,9 +101,11 @@ def _log_call(kind: str, text: str, context: str | None, out: str, usage: tuple[
 
 
 def _call(kind: str, prompt_file: str, text: str, context: str | None,
-          max_tokens: int = 1024) -> tuple[str | None, tuple[int, int]]:
+          max_tokens: int = 1024, note: str | None = None) -> tuple[str | None, tuple[int, int]]:
     """One API call: (result text or None, (input tokens, output tokens))."""
     system = open(os.path.join(_HERE, "prompts", prompt_file)).read()
+    if note:
+        system += f"\n\n{note}"
     req = _request(os.environ["TUTI_LLM_BASE_URL"], os.environ["TUTI_LLM_MODEL"],
                    os.environ["TUTI_LLM_API_KEY"], system, text, context, max_tokens)
     try:
@@ -134,7 +137,10 @@ def intent(text: str) -> tuple[dict | None, tuple[int, int]]:
     """
     if not configured():
         return None, (0, 0)
-    out, usage = _call("intent", "intent.md", text, context=None, max_tokens=300)
+    # the model has no clock: without today's date it cannot turn «فردا» into an ISO day
+    today = datetime.now().strftime("%Y-%m-%d (%A)")
+    out, usage = _call("intent", "intent.md", text, context=None, max_tokens=300,
+                       note=f"تاریخ امروز: {today}")
     if not out:
         return None, usage
     try:

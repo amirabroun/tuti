@@ -68,6 +68,11 @@ Canonical app: `build/Build/Products/Debug/tuti.app` — the single copy on the 
 - macOS has NO Persian TTS voice (checked 2026-11-09) — read-back was skipped for that reason.
 - Swift: `FileHandle.write(contentsOf:)`, not `(contents:)`. Carbon keycodes in
   HotkeyCenter are raw ints (49=Space, 9=V) — kVK_* names don't resolve in this target.
+- Space (Record) is a local key monitor in TranscriptViewModel, NOT a button
+  keyboardShortcut: a bare-Space SwiftUI shortcut also fires while a TextField has focus
+  (search, card edit would toggle the mic mid-typing).
+- The intent call appends «تاریخ امروز» to prompts/intent.md per call — the model has no
+  clock; without it «فردا» cannot become an ISO date.
 - The server refuses any Origin header — browsers blocked on purpose (personal app).
 - Test servers: port 8766 only (`pkill -f "server.py --port 8766"`); NEVER kill his app/server
   on 8765. Launch the built app only if `pgrep -f tuti.app/Contents/MacOS/tuti` is empty.

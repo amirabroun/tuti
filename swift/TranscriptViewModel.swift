@@ -83,6 +83,7 @@ final class TranscriptViewModel {
     private var stallTask: Task<Void, Never>?
     private var finalRaw: String?  // asr_final's raw text, saved to history once its clean resolves
     private var hotkey: HotkeyCenter?
+    private var spaceMonitor: Any?
     private var pasteTask: Task<Void, Never>?
     /// The app that was frontmost when ⌥Space started the recording; the result pastes back into it.
     private var pasteTarget: NSRunningApplication?
@@ -112,6 +113,19 @@ final class TranscriptViewModel {
         hotkey = HotkeyCenter()
         hotkey?.onToggle = { [weak self] in Task { @MainActor in self?.hotkeyToggleRecord() } }
         hotkey?.start()
+        // Space toggles Record — claimed only when nothing else has focus: a text view
+        // first responder (search field, card edit) keeps its spaces.
+        spaceMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            MainActor.assumeIsolated {
+                guard let self,
+                      event.charactersIgnoringModifiers == " ",
+                      event.modifierFlags.intersection([.command, .option, .control, .shift, .function]).isEmpty,
+                      !event.isARepeat,
+                      let window = NSApp.keyWindow, window.firstResponder === window else { return event }
+                self.toggleRecord()
+                return nil
+            }
+        }
         sidecar.start()
         socket.connect()
     }
@@ -209,13 +223,18 @@ final class TranscriptViewModel {
         }
     }
 
-    /// Runs a card's parsed voice command (stage 3): the chip was clicked.
+    /// Runs a card's parsed voice command (stage 3): the chip was clicked. The osascript can
+    /// take seconds (Reminders may be launching), so it never blocks the UI thread; the chip
+    /// disappears immediately and returns only when the action failed.
     func runIntent(on id: UUID) {
-        guard let idx = cards.firstIndex(where: { $0.id == id }), let action = cards[idx].intent else { return }
-        if let error = DictationAction.run(action) {
-            lastError = error
-        } else {
-            cards[idx].intentDone = true
+        guard let idx = cards.firstIndex(where: { $0.id == id }), let action = cards[idx].intent,
+              !cards[idx].intentDone else { return }
+        cards[idx].intentDone = true  // also guards a double-click from firing the action twice
+        Task { [weak self] in
+            let error = await Task.detached { DictationAction.run(action) }.value
+            guard let self, let error else { return }
+            if let i = self.cards.firstIndex(where: { $0.id == id }) { self.cards[i].intentDone = false }
+            self.lastError = error
         }
     }
 
@@ -393,6 +412,7 @@ final class TranscriptViewModel {
 
     private func shutdown() {
         stallTask?.cancel()
+        if let spaceMonitor { NSEvent.removeMonitor(spaceMonitor) }
         mic.stop()
         socket.disconnect()
         sidecar.stop()
