@@ -12,8 +12,7 @@
 
 Starts a fake OpenAI-style API on :8899 that answers "MOCKn" and records request bodies,
 then drives one recording over the socket. Pins the stage-2 promise: cleaned text is never
-sent again (only the new speech, with the cleaned text as context), and the reclean action
-does send the whole transcript.
+sent again (only the new speech, with the cleaned text as context).
 """
 
 import asyncio
@@ -70,8 +69,6 @@ async def main() -> int:
         await asyncio.sleep(0.5)
         await ws.send(json.dumps({"v": 1, "type": "control", "action": "cut"}))
         await asyncio.sleep(1.0)
-        await ws.send(json.dumps({"v": 1, "type": "control", "action": "reclean"}))
-        await asyncio.sleep(1.0)
         await ws.send(json.dumps({"v": 1, "type": "control", "action": "stop"}))
         await asyncio.sleep(3)
         reader.cancel()
@@ -91,10 +88,11 @@ async def main() -> int:
         print("FAIL:", msg)
         return 1
 
-    if len(texts) < 3:
-        return fail("expected at least 3 API requests (two deltas + reclean)")
-    if "تستینگ" not in texts[0]:
-        return fail("request 0 should carry the first sentence")
+    if len(texts) < 2:
+        return fail("expected at least 2 API requests (two deltas)")
+    # a cut can land mid-word on the ASR timeline ("تستینگ" -> "تست" + "ینگ"): timing, not a bug
+    if "تست" not in texts[0]:
+        return fail("request 0 should carry the first speech")
     # a delta request carries the locked text as a context user message; its own text is only
     # the NEW speech — the locked text must never be sent again as the text to clean
     with_ctx = [r for r in requests_seen if len(user_texts(r)) > 1]
@@ -102,17 +100,17 @@ async def main() -> int:
         return fail("cleaned text was sent again as a delta")
     if not with_ctx or "MOCK1" not in user_texts(with_ctx[0])[0]:
         return fail("second delta should carry the cleaned text as context")
-    # reclean: no context, and the whole transcript as the text
-    if not any(len(user_texts(r)) == 1 and "تستینگ" in r["text"] and "اندرو" in r["text"]
-               for r in requests_seen):
-        return fail("no request carried the whole transcript (reclean)")
-    # display text only grows by appending (until a reclean replaces it)
+    # display text only grows by appending
     plain = [t for _, t in clean_alls]
     for a, b in zip(plain, plain[1:]):
         if not (b.startswith(a) or "MOCK" in b and b.count("MOCK") <= a.count("MOCK") + 1):
             return fail(f"cleaned text not kept/appended: {a!r} -> {b!r}")
     if not any(f for f, _ in clean_alls):
         return fail("no final clean_all after stop")
+    # the intent pass fires once after the final clean, on the full transcript, no context
+    final_text = [t for f, t in clean_alls if f][-1]
+    if texts[-1] != f"<t>{final_text}</t>":
+        return fail("the intent pass should send the whole final transcript once")
     print("PASS")
     return 0
 

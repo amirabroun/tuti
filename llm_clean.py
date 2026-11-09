@@ -1,22 +1,28 @@
-"""Stage 2: send a raw ASR transcript to an LLM API, get clean Persian back.
+"""Stage 2/3: LLM calls for tuti — text cleanup and voice-command intent.
 
 Two dialects, picked from the base URL:
   OpenAI-compatible chat/completions — TUTI_LLM_BASE_URL e.g. https://api.openai.com/v1
   Anthropic-compatible messages      — TUTI_LLM_BASE_URL e.g. https://api.z.ai/api/anthropic
                                        (Z.ai coding-plan keys only speak this one)
 Config: `.env` in the repo root or the real environment (real environment wins):
-  TUTI_LLM_BASE_URL, TUTI_LLM_MODEL (e.g. gpt-4o-mini / glm-5.3-flash), TUTI_LLM_API_KEY
-Any of them empty -> cleanup is off. On any failure clean() returns None and the caller
-keeps the raw text. Standard library only, so server.py and test_clean.py share it.
+  TUTI_LLM_BASE_URL, TUTI_LLM_MODEL (e.g. gpt-4o-mini / glm-4.5-air), TUTI_LLM_API_KEY
+Any of them empty -> cleaning is off. On any failure the text comes back None and the
+caller keeps the raw text. Standard library only, so server.py and test_clean.py share it.
+
+Every call returns its token usage and is appended (input, context, output, tokens) to
+~/Library/Application Support/tuti/llm_calls.jsonl — the before/after record for prompt
+testing.
 """
 
 import json
 import os
+import time
 import urllib.request
 
 TIMEOUT = 15  # s; a clean that never returns must not pile up
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_CALLS_URL = os.path.expanduser("~/Library/Application Support/tuti/llm_calls.jsonl")
 
 
 def load_env() -> None:
@@ -46,21 +52,21 @@ def _unwrap(s: str) -> str:
 
 
 def _request(base: str, model: str, key: str, system: str, text: str,
-             context: str | None) -> urllib.request.Request:
+             context: str | None, max_tokens: int) -> urllib.request.Request:
     messages = []
     if context:  # the previous cleaned segment: resolves pronouns and ambiguous words across cuts
         messages.append({"role": "user",
                          "content": f"قطعهٔ قبلی گفتار (فقط برای ربط؛ بازنویسیش نکن): {context}"})
-    messages.append({"role": "user", "content": text})
+    messages.append({"role": "user", "content": f"<t>{text}</t>"})  # <t>: data, never a command
     if "anthropic" in base:  # Anthropic protocol: x-api-key, system at top level, content blocks
         url = base.rstrip("/") + "/v1/messages"
-        body = {"model": model, "max_tokens": 1024, "temperature": 0,
+        body = {"model": model, "max_tokens": max_tokens, "temperature": 0,
                 "thinking": {"type": "disabled"},  # an editor, not a thinker
                 "system": system, "messages": messages}
         headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
     else:  # OpenAI protocol
         url = base if base.endswith("/chat/completions") else base.rstrip("/") + "/chat/completions"
-        body = {"model": model, "temperature": 0,
+        body = {"model": model, "temperature": 0, "max_tokens": max_tokens,
                 "messages": [{"role": "system", "content": system}] + messages}
         headers = {"Authorization": f"Bearer {key}"}
     return urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
@@ -73,23 +79,69 @@ def _text_of(response: dict) -> str:
     return "".join(b["text"] for b in response.get("content", []) if b.get("type") == "text")
 
 
-def clean(text: str, context: str | None = None, style: str | None = None) -> str | None:
-    """Cleaned text, or None when off or failed — the caller keeps the raw text then.
+def _usage_of(response: dict) -> tuple[int, int]:
+    u = response.get("usage") or {}
+    if "input_tokens" in u:  # Anthropic
+        return u.get("input_tokens", 0), u.get("output_tokens", 0)
+    return u.get("prompt_tokens", 0), u.get("completion_tokens", 0)  # OpenAI
 
-    context: the previous cleaned segment, sent only for continuity (never rewritten).
-    style: "formal" formalizes spoken words; None/"spoken" keeps them as spoken.
-    """
-    if not configured():
-        return None
-    system = open(os.path.join(_HERE, "prompts", "clean.md")).read()
-    if style == "formal":
-        system += "\nسطح کلام را رسمی کن: صورت رسمی کلمات محاوره‌ای (مثل «ازشون» → «از آنها»)."
+
+def _log_call(kind: str, text: str, context: str | None, out: str, usage: tuple[int, int]) -> None:
+    """The raw model answer (pre-unwrap) is the interesting half for prompt testing."""
+    line = json.dumps({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "kind": kind,
+                       "in_text": text, "context": context, "out_text": out,
+                       "in": usage[0], "out": usage[1]}, ensure_ascii=False)
+    try:
+        os.makedirs(os.path.dirname(_CALLS_URL), exist_ok=True)
+        with open(_CALLS_URL, "a") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        print(f"call log write failed: {e}", flush=True)
+
+
+def _call(kind: str, prompt_file: str, text: str, context: str | None,
+          max_tokens: int = 1024) -> tuple[str | None, tuple[int, int]]:
+    """One API call: (result text or None, (input tokens, output tokens))."""
+    system = open(os.path.join(_HERE, "prompts", prompt_file)).read()
     req = _request(os.environ["TUTI_LLM_BASE_URL"], os.environ["TUTI_LLM_MODEL"],
-                   os.environ["TUTI_LLM_API_KEY"], system, text, context)
+                   os.environ["TUTI_LLM_API_KEY"], system, text, context, max_tokens)
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            out = _text_of(json.load(r))
+            response = json.load(r)
+            out, usage = _text_of(response), _usage_of(response)
     except Exception as e:
-        print(f"llm clean failed: {e}", flush=True)
-        return None
-    return _unwrap(out) or None
+        print(f"llm {kind} failed: {e}", flush=True)
+        return None, (0, 0)
+    _log_call(kind, text, context, out, usage)
+    return _unwrap(out) or None, usage
+
+
+def clean(text: str, context: str | None = None) -> tuple[str | None, tuple[int, int]]:
+    """(Cleaned text or None — the caller keeps the raw text then —, token usage).
+
+    context: the previous cleaned segment, sent only for continuity (never rewritten).
+    """
+    if not configured():
+        return None, (0, 0)
+    return _call("clean", "clean.md", text, context)
+
+
+def intent(text: str) -> tuple[dict | None, tuple[int, int]]:
+    """A voice command parsed off a final transcript: ({"action": ..., ...} or None, usage).
+
+    None = off, failed, or not JSON — nothing to run. "action":"none" means the transcript
+    was plain dictation; the caller decides what to drop.
+    """
+    if not configured():
+        return None, (0, 0)
+    out, usage = _call("intent", "intent.md", text, context=None, max_tokens=300)
+    if not out:
+        return None, usage
+    try:
+        parsed = json.loads(out)
+    except ValueError:
+        print(f"intent was not JSON: {out[:120]!r}", flush=True)
+        return None, usage
+    if not isinstance(parsed, dict) or not parsed.get("action"):
+        return None, usage
+    return parsed, usage

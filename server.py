@@ -7,11 +7,9 @@
     uv run server.py          # loads the model (~10 s on MPS), then listens on ws://127.0.0.1:8765
 
 Protocol v1 -- JSON text frames (real unicode), binary audio frames:
-  app -> server   {"v":1,"type":"control","action":"start","sample_rate":48000,"style":"spoken"}
+  app -> server   {"v":1,"type":"control","action":"start","sample_rate":48000}
                   binary: float32 mono PCM at that sample rate (resampled here)
                   {"v":1,"type":"control","action":"cut"}    a speech pause: clean the new speech now
-                  {"v":1,"type":"control","action":"reclean"}  the Re-clean button: one request for the
-                                                                   WHOLE raw transcript; replaces the text
                   {"v":1,"type":"control","action":"stop"}
   server -> app   {"v":1,"type":"asr_partial","text":"..."}   raw text since the last cut (the tail)
                   {"v":1,"type":"clean_state","on":true}      a whole-text clean started ("Editing...")
@@ -23,8 +21,16 @@ Protocol v1 -- JSON text frames (real unicode), binary audio frames:
                                                                filled in.
                   {"v":1,"type":"asr_final","text":"..."}     the whole raw recording, once, after
                                                                stop; a terminator, not a line
+                  {"v":1,"type":"usage","in":N,"out":N}      cumulative LLM tokens since the
+                                                               server start, after every LLM call
+                  {"v":1,"type":"intent",...}                a voice command parsed off the FINAL
+                                                               transcript: {"action":"reminder",
+                                                               "title","when"} / {"action":"search",
+                                                               "query"} / {"action":"open","url"}.
+                                                               Sent only when cleaning is on and the
+                                                               transcript IS a command; the app runs
+                                                               it on a click, never automatically.
                   {"v":1,"type":"error","message":"..."}
-Reserved for later stages: agent_reply, tool_request, tool_result.
 The socket only opens once the model is loaded, so "connected" means "ready".
 Connections that send an Origin header (web pages in a browser) are refused with HTTP 403.
 """
@@ -94,7 +100,7 @@ class LiveSession:
     emit is called from worker threads; it must be thread-safe.
     """
 
-    def __init__(self, in_sr: int, emit, style: str = "spoken"):
+    def __init__(self, in_sr: int, emit):
         self.resampler = soxr.ResampleStream(in_sr, SR, 1, dtype="float32")
         self.emit = emit
         self.buf = np.zeros(SR * 60, dtype=np.float32)
@@ -106,9 +112,9 @@ class LiveSession:
         self.done = threading.Event()
         self.last_feed = time.monotonic()
         self.cut_at = 0  # code-point offset into the full text: where the display tail starts
-        self.style = style
         self.cleaned = ""  # text already cleaned and locked; only the tail after cut_at goes to the LLM again
-        self.clean_q: queue.Queue = queue.Queue()  # ("delta"|"whole", text, final) — one worker, in order
+        self.tok_in = self.tok_out = 0  # cumulative LLM tokens this server run (reported to the app)
+        self.clean_q: queue.Queue = queue.Queue()  # (text, final) — one worker, in order
         self.streamer = TranscriptStreamer(self._emit_partial)
         Thread(target=self._run, daemon=True).start()
         Thread(target=self._clean_worker, daemon=True).start()
@@ -132,28 +138,31 @@ class LiveSession:
             if not final:
                 self.emit("asr_partial", "")  # the display tail empties until speech resumes
         if delta and llm_clean.configured():
-            self.clean_q.put(("delta", delta, final))
-
-    def reclean(self) -> None:
-        """One request for the WHOLE raw transcript, replacing all cleaned text (the Re-clean button)."""
-        text = self.streamer.text.strip()
-        if text and llm_clean.configured():
-            self.clean_q.put(("whole", text, False))
+            self.clean_q.put((delta, final))
 
     def _clean_worker(self) -> None:
         """Cleans queued items one at a time, in order: every delta is cleaned with the locked
         text before it as context and appended to it; nothing is ever sent twice."""
         while True:
-            kind, text, final = self.clean_q.get()
+            text, final = self.clean_q.get()
             self.emit("clean_state", "on")
-            if kind == "delta":
-                cleaned = llm_clean.clean(text, context=self.cleaned or None, style=self.style)
-            else:
-                cleaned = llm_clean.clean(text, style=self.style)
+            cleaned, usage = llm_clean.clean(text, context=self.cleaned or None)
             if not cleaned:
                 cleaned = text  # the clean failed: this part is locked as raw instead of lost
-            self.cleaned = (self.cleaned + " " + cleaned).strip() if kind == "delta" else cleaned
+            self.cleaned = (self.cleaned + " " + cleaned).strip()
             self.emit("clean_all", self.cleaned, {"final": True} if final else None)
+            self._count(usage)
+            if final:
+                parsed, usage = llm_clean.intent(self.cleaned)
+                self._count(usage)
+                if parsed and parsed.get("action") not in (None, "", "none"):
+                    self.emit("intent", "", parsed)
+
+    def _count(self, usage: tuple[int, int]) -> None:
+        self.tok_in += usage[0]
+        self.tok_out += usage[1]
+        if usage != (0, 0):
+            self.emit("usage", "", {"in": self.tok_in, "out": self.tok_out})
 
     def _finish_recording(self) -> None:
         """After stop: clean what's left, or close the recording without a new request."""
@@ -251,6 +260,8 @@ async def _sender(ws, queue: asyncio.Queue) -> None:
             msg["message"] = text
         elif kind == "clean_state":
             msg["on"] = text == "on"
+        elif kind in ("usage", "intent"):
+            pass  # every field lives in extra
         else:
             msg["text"] = text
         msg.update(extra or {})
@@ -280,12 +291,9 @@ async def handler(ws) -> None:
                 if ACTIVE is not None and not ACTIVE.done.is_set():
                     queue.put_nowait(("error", "another recording is still running or finishing; try again in a moment", None))
                     continue
-                session = ACTIVE = LiveSession(int(m.get("sample_rate", SR)), emit,
-                                                "formal" if m.get("style") == "formal" else "spoken")
+                session = ACTIVE = LiveSession(int(m.get("sample_rate", SR)), emit)
             elif m.get("action") == "cut" and session is not None:
                 session.cut()
-            elif m.get("action") == "reclean" and session is not None:
-                session.reclean()
             elif m.get("action") == "stop" and session is not None:
                 session.finish()
     finally:
