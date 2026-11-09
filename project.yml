@@ -1,0 +1,26 @@
+name: tuti
+options:
+  bundleIdPrefix: com.amirabroun
+  deploymentTarget:
+    macOS: "14.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+targets:
+  tuti:
+    type: application
+    platform: macOS
+    sources: [swift]
+    scheme: {}
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: Tuti
+        NSMicrophoneUsageDescription: Tuti turns your speech into live text on this Mac.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.amirabroun.tuti
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_IDENTITY: "-"
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_HARDENED_RUNTIME: NO
