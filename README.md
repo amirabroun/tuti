@@ -21,7 +21,8 @@ Auto-stop end it. The window is a list of cards, one per recording (past ones lo
 click a card to copy it; every clean also lands on the clipboard. The server log appends to
 `~/Library/Logs/tuti/server.log`.
 
-Paths (repo, `uv`) are hard-coded in `Config` in `swift/App.swift` for now.
+Paths (repo `~/Documents/repos/tuti`, `uv`) are fixed in `Config` in `swift/App.swift`,
+resolved from the home directory.
 
 ## Server only
 

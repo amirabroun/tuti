@@ -3,8 +3,10 @@ import SwiftUI
 /// v1 hard-codes where things live; the app launches the Python server from the tuti repo.
 enum Config {
     static let serverURL = URL(string: "ws://127.0.0.1:8765")!
-    static let repoURL = URL(fileURLWithPath: "/Users/amirabroun/Documents/repos/tuti")
-    static let uvURL = URL(fileURLWithPath: "/Users/amirabroun/.local/bin/uv")
+    static let repoURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Documents/repos/tuti")
+    static let uvURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".local/bin/uv")
     static let logURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Logs/tuti/server.log")
     static let historyURL = FileManager.default.homeDirectoryForCurrentUser
