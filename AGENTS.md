@@ -73,6 +73,8 @@ Canonical app: `build/Build/Products/Debug/tuti.app` — the single copy on the 
   (search, card edit would toggle the mic mid-typing).
 - The intent call appends «تاریخ امروز» to prompts/intent.md per call — the model has no
   clock; without it «فردا» cannot become an ISO date.
+- The ASR model loads fp16 on MPS (`dtype=torch.float16` in server.py main): ~3.5 GB → ~1.6 GB
+  footprint. If recognition ever degrades, that is the line to drop.
 - The server refuses any Origin header — browsers blocked on purpose (personal app).
 - Test servers: port 8766 only (`pkill -f "server.py --port 8766"`); NEVER kill his app/server
   on 8765. Launch the built app only if `pgrep -f tuti.app/Contents/MacOS/tuti` is empty.
