@@ -21,11 +21,22 @@ Auto-stop end it. The window is a list of cards, one per recording (past ones lo
 click a card to copy it; every clean also lands on the clipboard. The server log appends to
 `~/Library/Logs/tuti/server.log`.
 
-The app also lives in the **menu bar** (status, record, the last 5 cards, token usage,
-Launch-at-Login, quit — closing the window just hides it). **⌥Space** is a global hotkey:
+The app also lives in the **menu bar** — the icon alone shows the state (mic + live word
+count while recording, a wand while the AI edits, waveform when idle) and the dropdown adds
+the last words heard, status, record, the last 5 cards, token usage, Launch-at-Login, quit
+(closing the window just hides it). **⌥Space** is a global hotkey:
 start speaking from any app; when the recording finishes, the text activates that app and
 pastes itself there (the in-app button never pastes — it keeps the card). Paste-back needs
 Tuti ticked in System Settings › Privacy & Security › Accessibility.
+
+On first launch the **Settings panel** asks for everything at once: the mic prompt and
+the Reminders automation prompt fire right there (Reminders opens briefly for the latter), and
+the Accessibility row — the one macOS only grants by hand — gets a button straight to its
+Settings pane. The same panel shows the LLM config actually loaded (model + server URL; the
+API key never leaves the server). Reopen it anytime from the menu bar (**Settings…**); the
+dots turn green live, and after a deny each row's button opens the exact Settings pane that
+undoes it. Errors (a failed paste, a missing permission) also show as a red line in the
+menu-bar dropdown.
 
 Paths (repo `~/Documents/repos/tuti`, `uv`) are fixed in `Config` in `swift/App.swift`,
 resolved from the home directory.
@@ -34,6 +45,7 @@ resolved from the home directory.
 
     uv run server.py            # ws://127.0.0.1:8765
     uv run test_ws_client.py    # smoke test: streams 48 kHz audio, expects partials + a final
+    uv run test_final_clean.py  # mock LLM: no call before stop, one clean + one intent after (docstring has the setup)
     uv run test_error_path.py   # a model failure mid-recording still ends with an error (no server needed)
 
 Protocol: the docstring at the top of `server.py`. Plan: `docs/plans/2026-11-08-stage1.md`.
@@ -42,15 +54,17 @@ Protocol: the docstring at the top of `server.py`. Plan: `docs/plans/2026-11-08-
 
 Fill `.env` (gitignored) with an LLM API — `TUTI_LLM_BASE_URL`, `TUTI_LLM_MODEL`,
 `TUTI_LLM_API_KEY`; any OpenAI-compatible `/chat/completions` endpoint, or an Anthropic
-endpoint (Z.ai keys are Anthropic-only: `https://api.z.ai/api/anthropic`). Then, while you
-record: go quiet for ~3 s and the **new speech** goes for cleaning with the already-cleaned
-text as context — the cleaned result is appended to the locked text, so nothing is ever
-sent (or paid for) twice. Stop cleans the remainder and finalizes the history entry.
+endpoint (Z.ai keys are Anthropic-only: `https://api.z.ai/api/anthropic`). The LLM is never
+called mid-recording: while you record the raw transcript streams live (window card and menu
+bar); when the recording stops, the whole transcript goes for **one clean** and the result
+replaces the raw text. Recordings are short and glm-4.5-air is fast, so the one call is a
+couple of seconds.
 English words spoken in English come back in English (دیپلوی ← deploy); loanwords that
-are normal Persian (فایل، سرور) stay Persian. While a clean is in flight the active card
-shows a progress bar (`در حال ویرایش…`); if the API fails, that part is locked as raw text and
-the recording is unaffected. Empty `.env` = cleanup off, raw text as before. The system prompt
-lives in `prompts/clean.md` (raw text is sent wrapped in `<t>…</t>`).
+are normal Persian (فایل، سرور) stay Persian. While the final clean is in flight the active
+card shows a progress bar (`در حال ویرایش…`) and the menu-bar icon a wand; if the API fails,
+the raw text becomes the result and the recording is unaffected. Empty `.env` = cleanup off,
+raw text as before. The system prompt lives in `prompts/clean.md` (raw text is sent wrapped
+in `<t>…</t>`).
 
 Finished text is split into paragraphs (a break every 3 sentence enders — deterministic,
 no extra LLM call), and every LLM call (input, context, raw model output, token usage) is
@@ -68,7 +82,7 @@ open-URL commands work the same way. Nothing ever runs automatically; plain dict
 answers `none` and costs one small call per recording.
 
 **Auto-stop** (checkbox, on by default): ~4 s without new text ends the recording by itself
-(the 3 s pause before it already sent the new speech for cleaning).
+(and the one clean follows).
 
 **History**: every recording (raw + clean + timestamp) is stored as JSONL in
 `~/Library/Application Support/tuti/history.jsonl` and loaded back as cards on launch

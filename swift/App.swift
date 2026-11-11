@@ -17,6 +17,7 @@ enum Config {
 @main
 struct TutiApp: App {
     @State private var model = TranscriptViewModel()
+    @State private var permissions = PermissionsModel()
 
     var body: some Scene {
         // closing the window hides to the menu bar (it is a scene too); Quit lives there
@@ -24,11 +25,28 @@ struct TutiApp: App {
             ContentView(model: model)
                 .frame(minWidth: 460, minHeight: 440)
                 .onAppear { model.appStart() }
+                .environment(permissions)
         }
         MenuBarExtra {
             MenuBarContent(model: model)
         } label: {
-            Image(systemName: model.phase == .recording ? "mic.fill" : "waveform")
+            // the state at a glance, no click: recording (live word count) / AI editing / idle
+            HStack(spacing: 4) {
+                switch model.phase {
+                case .recording:
+                    Image(systemName: "mic.fill")
+                    Text(verbatim: model.wordCount.formatted(.number.locale(Locale(identifier: "fa_IR"))))
+                case .finalizing:
+                    Image(systemName: "wand.and.stars")
+                case .starting, .ready:
+                    Image(systemName: "waveform")
+                }
+            }
+        }
+        // opens only via openWindow (first launch, menu bar) — never at app launch
+        Window("Settings", id: "settings") {
+            PermissionsView(model: model)
+                .environment(permissions)
         }
     }
 }
@@ -40,7 +58,15 @@ private struct MenuBarContent: View {
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     var body: some View {
+        if model.phase == .recording {
+            Text(liveTail).lineLimit(2)  // the last words heard: proof it is following the speech
+            Divider()
+        }
         Text(model.statusText)
+        if !model.lastError.isEmpty {
+            // paste/permission failures must be visible without opening the window
+            Text(model.lastError).foregroundStyle(.red)
+        }
         Text("tokens: \(model.tokensIn.formatted()) in · \(model.tokensOut.formatted()) out")
         Divider()
         Button(model.phase == .recording ? "Stop" : "Record") { model.uiToggleRecord() }
@@ -64,9 +90,20 @@ private struct MenuBarContent: View {
             openWindow(id: "main")
             NSApp.activate(ignoringOtherApps: true)
         }
+        Button("Settings…") {
+            openWindow(id: "settings")
+            NSApp.activate(ignoringOtherApps: true)
+        }
         Divider()
         Button("Quit Tuti") { NSApp.terminate(nil) }
             .keyboardShortcut("q")
+    }
+
+    /// The last ~60 chars of the raw transcript so far, flat; the freshest proof the mic is followed.
+    private var liveTail: String {
+        let flat = model.partial.replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespaces)
+        return flat.isEmpty ? "…" : (flat.count > 60 ? "…" + String(flat.suffix(60)) : flat)
     }
 
     private func menuTitle(_ text: String) -> String {
@@ -77,6 +114,8 @@ private struct MenuBarContent: View {
 
 struct ContentView: View {
     let model: TranscriptViewModel
+    @Environment(PermissionsModel.self) private var permissions
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(spacing: 12) {
@@ -104,6 +143,14 @@ struct ContentView: View {
                     }
                     .buttonStyle(.borderless)
                 }
+                Button {
+                    openWindow(id: "settings")
+                    NSApp.activate(ignoringOtherApps: true)
+                } label: {
+                    Image(systemName: "gearshape").foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help("تنظیمات")
             }
 
             ScrollViewReader { proxy in
@@ -159,6 +206,13 @@ struct ContentView: View {
             .disabled(model.phase != .ready && model.phase != .recording)
         }
         .padding()
+        .onAppear {
+            // first run only: ask every permission at once, panel on top as the guide
+            if permissions.firstLaunchCheck() {
+                openWindow(id: "settings")
+                NSApp.activate(ignoringOtherApps: true)
+            }
+        }
     }
 
     private var statusColor: Color {

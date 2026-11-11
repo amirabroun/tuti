@@ -2,17 +2,18 @@
 # requires-python = ">=3.11"
 # dependencies = ["numpy", "websockets>=14"]
 # ///
-"""Delta-cleaning check: a mock LLM records every request the server makes.
+"""Final-clean check: a mock LLM records every request the server makes.
 
     # terminal 1 — the server must point at the mock:
     TUTI_LLM_BASE_URL=http://127.0.0.1:8899/v1 TUTI_LLM_MODEL=mock TUTI_LLM_API_KEY=x \
       uv run --offline server.py --port 8766
     # terminal 2:
-    URI=ws://127.0.0.1:8766 uv run test_cut_request.py
+    URI=ws://127.0.0.1:8766 uv run test_final_clean.py
 
 Starts a fake OpenAI-style API on :8899 that answers "MOCKn" and records request bodies,
-then drives one recording over the socket. Pins the stage-2 promise: cleaned text is never
-sent again (only the new speech, with the cleaned text as context).
+then drives one recording over the socket. Pins the stage-4 promise: no LLM call before
+stop, even across a speech pause; after stop exactly one clean of the whole raw transcript
+(no context message), then one intent pass on its result.
 """
 
 import asyncio
@@ -50,27 +51,31 @@ class Mock(BaseHTTPRequestHandler):
 async def main() -> int:
     first = make_audio("Hello, this is a test of the live streaming pipeline.")
     second = make_audio("Another sentence follows the pause here.")
-    clean_alls: list[tuple[bool, str]] = []
+    clean_alls: list[str] = []
+    final = None
 
     async with websockets.connect(URI) as ws:
         async def read() -> None:
+            nonlocal final
             async for msg in ws:
                 m = json.loads(msg)
                 if m["type"] == "clean_all":
-                    clean_alls.append((m.get("final", False), m["text"]))
+                    clean_alls.append(m["text"])
+                elif m["type"] == "asr_final":
+                    final = m["text"]
 
         reader = asyncio.create_task(read())
         await ws.send(json.dumps({"v": 1, "type": "control", "action": "start", "sample_rate": RATE}))
         await stream(ws, first)
-        await asyncio.sleep(0.2)
-        await ws.send(json.dumps({"v": 1, "type": "control", "action": "cut"}))
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.8)  # a pause long enough that stage 2 would have cut here
         await stream(ws, second)
-        await asyncio.sleep(0.5)
-        await ws.send(json.dumps({"v": 1, "type": "control", "action": "cut"}))
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.5)  # let the decode settle so the whole text is in
+        mid_calls = len(requests_seen)
         await ws.send(json.dumps({"v": 1, "type": "control", "action": "stop"}))
-        await asyncio.sleep(3)
+        for _ in range(100):  # the final clean + intent arrive after asr_final
+            if final is not None and len(requests_seen) >= 2 and clean_alls:
+                break
+            await asyncio.sleep(0.1)
         reader.cancel()
 
     texts = [r["text"] for r in requests_seen]
@@ -78,39 +83,30 @@ async def main() -> int:
     def user_texts(r: dict) -> list[str]:
         return [m["content"] for m in r["messages"] if m["role"] == "user"]
 
-    print(f"api requests: {len(texts)}")
+    print(f"api requests: {len(texts)}  (before stop: {mid_calls})")
     for i, t in enumerate(texts):
         print(f"  req {i}: {t!r}")
-    for f, t in clean_alls:
-        print(f"clean_all{' (final)' if f else ''}: {t!r}")
+    for t in clean_alls:
+        print(f"clean_all: {t!r}")
 
     def fail(msg: str) -> int:
         print("FAIL:", msg)
         return 1
 
-    if len(texts) < 2:
-        return fail("expected at least 2 API requests (two deltas)")
-    # a cut can land mid-word on the ASR timeline ("تستینگ" -> "تست" + "ینگ"): timing, not a bug
-    if "تست" not in texts[0]:
-        return fail("request 0 should carry the first speech")
-    # a delta request carries the locked text as a context user message; its own text is only
-    # the NEW speech — the locked text must never be sent again as the text to clean
-    with_ctx = [r for r in requests_seen if len(user_texts(r)) > 1]
-    if any("تستینگ" in r["text"] for r in with_ctx):
-        return fail("cleaned text was sent again as a delta")
-    if not with_ctx or "MOCK1" not in user_texts(with_ctx[0])[0]:
-        return fail("second delta should carry the cleaned text as context")
-    # display text only grows by appending
-    plain = [t for _, t in clean_alls]
-    for a, b in zip(plain, plain[1:]):
-        if not (b.startswith(a) or "MOCK" in b and b.count("MOCK") <= a.count("MOCK") + 1):
-            return fail(f"cleaned text not kept/appended: {a!r} -> {b!r}")
-    if not any(f for f, _ in clean_alls):
-        return fail("no final clean_all after stop")
-    # the intent pass fires once after the final clean, on the full transcript, no context
-    final_text = [t for f, t in clean_alls if f][-1]
-    if texts[-1] != f"<t>{final_text}</t>":
-        return fail("the intent pass should send the whole final transcript once")
+    if mid_calls != 0:
+        return fail("no LLM call may happen before stop, even across a pause")
+    if len(texts) != 2:
+        return fail("expected exactly 2 API requests after stop (clean + intent)")
+    if not final:
+        return fail("no asr_final arrived")
+    if texts[0] != f"<t>{final}</t>":
+        return fail("the clean should send the whole raw transcript, once")
+    if len(user_texts(requests_seen[0])) != 1:
+        return fail("the clean carries no context message anymore")
+    if clean_alls != ["MOCK1"]:
+        return fail(f"expected exactly one clean_all == MOCK1, got {clean_alls}")
+    if texts[1] != "<t>MOCK1</t>":
+        return fail("the intent pass should run once, on the cleaned transcript")
     print("PASS")
     return 0
 

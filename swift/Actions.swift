@@ -65,7 +65,7 @@ enum DictationAction: Equatable {
     private static func osa(_ title: String) -> String { title.replacingOccurrences(of: "\"", with: "\\\"") }
 
     /// Runs an AppleScript; its stderr comes back as the error message.
-    private static func osa(_ source: String) -> String? {
+    static func osa(_ source: String) -> String? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         p.arguments = ["-e", source]
