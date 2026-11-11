@@ -41,8 +41,6 @@ struct Card: Identifiable {
 final class TranscriptViewModel {
     enum Phase { case starting, ready, recording, finalizing }
 
-    /// A speech pause this long sends the new speech for cleaning (the cleaned text before it is locked).
-    let cutAfter: TimeInterval = 3
     /// With autoStop on, silence this long (since the last new text) ends the recording.
     let stopAfter: TimeInterval = 4
 
@@ -56,6 +54,9 @@ final class TranscriptViewModel {
     private(set) var cleaning = false
     private(set) var tokensIn = 0  // cumulative LLM tokens the server reports after each call
     private(set) var tokensOut = 0
+    private(set) var llmModel = ""   // the config the server actually loaded (Settings panel);
+    private(set) var llmBaseURL = "" // the key itself never leaves the server process
+    private(set) var llmClean = false
     var searchQuery = ""
     var autoStop: Bool { didSet { UserDefaults.standard.set(autoStop, forKey: "autoStop") } }
 
@@ -67,12 +68,15 @@ final class TranscriptViewModel {
         }
     }
 
+    /// Words heard so far — the menu bar's live "it is following me" signal.
+    var wordCount: Int { partial.split(whereSeparator: \.isWhitespace).count }
+
     var statusText: String {
         switch phase {
         case .starting: return "Loading the model…"
         case .ready: return copied ? "Ready · copied" : "Ready"
         case .recording: return "Listening"
-        case .finalizing: return "Finishing…"
+        case .finalizing: return cleaning ? "Editing…" : "Finishing…"
         }
     }
 
@@ -80,7 +84,7 @@ final class TranscriptViewModel {
     private let socket = WSClient()
     private let mic = MicStreamer()
     private var started = false
-    private var stallTask: Task<Void, Never>?
+    private var autoStopTask: Task<Void, Never>?
     private var finalRaw: String?  // asr_final's raw text, saved to history once its clean resolves
     private var hotkey: HotkeyCenter?
     private var spaceMonitor: Any?
@@ -166,9 +170,9 @@ final class TranscriptViewModel {
             socket.send(["v": 1, "type": "control", "action": "start",
                          "sample_rate": mic.sampleRate])
             phase = .recording
-            scheduleStall()
+            scheduleAutoStop()
         case .recording:
-            stallTask?.cancel()
+            autoStopTask?.cancel()
             mic.stop()
             socket.send(["v": 1, "type": "control", "action": "stop"])
             phase = .finalizing
@@ -238,19 +242,15 @@ final class TranscriptViewModel {
         }
     }
 
-    /// Restart the no-new-text timer on every partial. When it fires: cut (freeze + clean); with
-    /// autoStop on, a second stretch of silence ends the recording by the Stop path.
-    private func scheduleStall() {
-        stallTask?.cancel()
-        guard phase == .recording else { return }
-        stallTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(self?.cutAfter ?? 4.5))
+    /// Restart the no-new-text timer on every partial. When it fires (autoStop on): the
+    /// recording ends by the Stop path — the one clean happens after stop, not here.
+    private func scheduleAutoStop() {
+        autoStopTask?.cancel()
+        guard phase == .recording, autoStop else { return }
+        autoStopTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(self?.stopAfter ?? 4))
             guard let self, !Task.isCancelled, self.phase == .recording else { return }
-            self.socket.send(["v": 1, "type": "control", "action": "cut"])
-            guard self.autoStop else { return }
-            try? await Task.sleep(for: .seconds(self.stopAfter - self.cutAfter))
-            guard !Task.isCancelled, self.phase == .recording else { return }
-            self.toggleRecord()  // .finalizing makes a late second fire harmless
+            self.toggleRecord()
         }
     }
 
@@ -260,7 +260,7 @@ final class TranscriptViewModel {
             phase = .ready
         } else {
             mic.stop()
-            stallTask?.cancel()
+            autoStopTask?.cancel()
             phase = .starting
         }
     }
@@ -269,34 +269,39 @@ final class TranscriptViewModel {
         switch message["type"] as? String {
         case "asr_partial":
             partial = message["text"] as? String ?? partial
-            scheduleStall()
+            scheduleAutoStop()
         case "clean_state":
             cleaning = message["on"] as? Bool ?? false
             if !cleaning, let raw = finalRaw {  // no clean is coming: the raw text is final
                 finalRaw = nil
+                if dropDeletedRecording() { return }
+                phase = .ready
                 if !raw.isEmpty {
                     finishCard(raw: raw, clean: nil)
                 }
             }
         case "clean_all":
-            // the cleaned transcript so far: replaces the active card's text, lands on the clipboard
+            // the cleaned whole transcript, once, after stop
+            cleaning = false
+            if dropDeletedRecording() { return }
             if let text = message["text"] as? String, !text.isEmpty {
                 updateLastCard { $0.text = text }
-                copyToPasteboard(text)
             }
-            cleaning = false
-            if message["final"] as? Bool == true {
-                if let raw = finalRaw {
-                    finalRaw = nil
-                    finishCard(raw: raw, clean: cards.last?.text.isEmpty == false ? cards.last?.text : nil)
-                } else {
-                    updateLastCard { $0.isFinal = true }
-                    maybePaste()
-                }
+            if let raw = finalRaw {
+                finalRaw = nil
+                finishCard(raw: raw, clean: cards.last?.text.isEmpty == false ? cards.last?.text : nil)
+            } else {
+                updateLastCard { $0.isFinal = true }
+                maybePaste()
             }
+            phase = .ready
         case "usage":
             tokensIn = message["in"] as? Int ?? tokensIn
             tokensOut = message["out"] as? Int ?? tokensOut
+        case "config":
+            llmModel = message["model"] as? String ?? llmModel
+            llmBaseURL = message["base_url"] as? String ?? llmBaseURL
+            llmClean = message["clean"] as? Bool ?? llmClean
         case "intent":
             // arrives after the final clean; attach to the most recent finished card
             if let action = DictationAction.from(message: message),
@@ -305,22 +310,23 @@ final class TranscriptViewModel {
                 cards[idx].intentDone = false
             }
         case "asr_final":
-            // terminator: the clean of this text (final:true) may still arrive
+            // terminator: the one clean (clean_all, or clean_state off) may still arrive
             finalRaw = message["text"] as? String
             partial = ""
-            stallTask?.cancel()
+            autoStopTask?.cancel()
             mic.stop()  // the server can end a recording itself (idle timeout); a live tap would crash the next start
-            phase = .ready
+            if dropDeletedRecording() { return }
             if let last = cards.last, !last.isFinal, last.text.isEmpty, finalRaw?.isEmpty != false {
                 cards.removeLast()  // nothing was said: no blank card, no history entry
                 pasteTarget = nil  // …and nowhere to paste
+                phase = .ready
             } else if let raw = finalRaw {
-                updateLastCard { $0.raw = raw }
+                updateLastCard { $0.raw = raw }  // stays .finalizing until the clean resolves
             }
         case "error":
             lastError = message["message"] as? String ?? "Unknown error"
             partial = ""
-            stallTask?.cancel()
+            autoStopTask?.cancel()
             mic.stop()
             pasteTarget = nil
             if phase == .recording || phase == .finalizing { phase = .ready }
@@ -330,6 +336,19 @@ final class TranscriptViewModel {
         default:
             break
         }
+    }
+
+    /// A recording whose card was deleted mid-flight is dropped whole: finishing it would
+    /// write onto the previous card (updateLastCard/saveHistory always target cards.last).
+    /// True = dropped, caller returns; the recording never reaches history or the clipboard.
+    private func dropDeletedRecording() -> Bool {
+        guard let last = cards.last, !last.isFinal else {
+            finalRaw = nil
+            pasteTarget = nil
+            phase = .ready
+            return true
+        }
+        return false
     }
 
     /// One place where a recording resolves: paragraph the display text, save history,
@@ -411,7 +430,7 @@ final class TranscriptViewModel {
     }
 
     private func shutdown() {
-        stallTask?.cancel()
+        autoStopTask?.cancel()
         if let spaceMonitor { NSEvent.removeMonitor(spaceMonitor) }
         mic.stop()
         socket.disconnect()

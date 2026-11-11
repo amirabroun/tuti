@@ -32,19 +32,24 @@ final class HotkeyCenter {
         if let handler { RemoveEventHandler(handler) }
     }
 
-    /// Pastes the clipboard into `app`: reactivates it and posts ⌘V. Returns an error string
-    /// when Tuti is not trusted for Accessibility (synthetic keys are dropped without it).
+    /// Pastes the clipboard into `app`: reactivates it and posts ⌘V — straight to the app's
+    /// PID, so a focus miss during the LLM round-trip (menu bar open, another app took the
+    /// click) cannot swallow the keystroke into the wrong place. Returns an error string when
+    /// Tuti is not trusted for Accessibility (synthetic keys are dropped without it).
     static func paste(into app: NSRunningApplication) -> String? {
         guard AXIsProcessTrusted() else {
             return "Paste needs Tuti in System Settings › Privacy & Security › Accessibility"
         }
         _ = app.activate()
-        Thread.sleep(forTimeInterval: 0.15)  // let the app take focus before the key lands
+        let deadline = Date().addingTimeInterval(1.0)  // wait for activation, not a fixed sleep
+        while !app.isActive && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
         for keyDown in [true, false] {
             let event = CGEvent(keyboardEventSource: nil, virtualKey: 9,  // V keycode
                                 keyDown: keyDown)
             if keyDown { event?.flags = CGEventFlags(rawValue: 1 << 20) }  // 1<<20 = command
-            event?.post(tap: .cghidEventTap)
+            event?.postToPid(app.processIdentifier)
         }
         return nil
     }
