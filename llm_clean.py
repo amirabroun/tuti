@@ -1,4 +1,4 @@
-"""Stage 2/3: LLM calls for tuti — text cleanup and voice-command intent.
+"""Stage 2/3: LLM calls for tuti — text cleanup, the agent-prompt mode, and voice-command intent.
 
 Two dialects, picked from the base URL:
   OpenAI-compatible chat/completions — TUTI_LLM_BASE_URL e.g. https://api.openai.com/v1
@@ -103,12 +103,14 @@ def _log_call(kind: str, text: str, context: str | None, out: str, usage: tuple[
 def _call(kind: str, prompt_file: str, text: str, context: str | None,
           max_tokens: int = 1024, note: str | None = None) -> tuple[str | None, tuple[int, int]]:
     """One API call: (result text or None, (input tokens, output tokens))."""
-    system = open(os.path.join(_HERE, "prompts", prompt_file)).read()
-    if note:
-        system += f"\n\n{note}"
-    req = _request(os.environ["TUTI_LLM_BASE_URL"], os.environ["TUTI_LLM_MODEL"],
-                   os.environ["TUTI_LLM_API_KEY"], system, text, context, max_tokens)
     try:
+        # the prompt files are hand-edited: a missing/broken one must fail like a dead API
+        # (None -> the caller keeps the raw text), not kill the calling thread
+        system = open(os.path.join(_HERE, "prompts", prompt_file)).read()
+        if note:
+            system += f"\n\n{note}"
+        req = _request(os.environ["TUTI_LLM_BASE_URL"], os.environ["TUTI_LLM_MODEL"],
+                       os.environ["TUTI_LLM_API_KEY"], system, text, context, max_tokens)
         with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
             response = json.load(r)
             out, usage = _text_of(response), _usage_of(response)
@@ -127,6 +129,14 @@ def clean(text: str, context: str | None = None) -> tuple[str | None, tuple[int,
     if not configured():
         return None, (0, 0)
     return _call("clean", "clean.md", text, context)
+
+
+def agent(text: str) -> tuple[str | None, tuple[int, int]]:
+    """Prompt mode's twin of clean(): the transcript rewritten as one terse prompt for a
+    coding agent (prompts/agent.md — condense + English tech terms)."""
+    if not configured():
+        return None, (0, 0)
+    return _call("agent", "agent.md", text, None)
 
 
 def intent(text: str) -> tuple[dict | None, tuple[int, int]]:
