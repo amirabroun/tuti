@@ -8,6 +8,9 @@
 
 Protocol v1 -- JSON text frames (real unicode), binary audio frames:
   app -> server   {"v":1,"type":"control","action":"start","sample_rate":48000}
+                  optional "mode":"agent" — the post-stop LLM pass rewrites the transcript
+                  as a terse coding-agent prompt (prompts/agent.md) instead of cleaning it
+                  (prompts/clean.md); absent = clean. Read once, at start.
                   binary: float32 mono PCM at that sample rate (resampled here)
                   {"v":1,"type":"control","action":"stop"}
   server -> app   {"v":1,"type":"asr_partial","text":"..."}   the whole raw transcript so far; the
@@ -103,8 +106,9 @@ class LiveSession:
     emit is called from worker threads; it must be thread-safe.
     """
 
-    def __init__(self, in_sr: int, emit):
+    def __init__(self, in_sr: int, emit, mode: str = "clean"):
         self.resampler = soxr.ResampleStream(in_sr, SR, 1, dtype="float32")
+        self.mode = mode  # which post-stop LLM pass this recording gets (fixed at start)
         self.emit = emit
         self.buf = np.zeros(SR * 60, dtype=np.float32)
         self.n = 0
@@ -129,7 +133,7 @@ class LiveSession:
             if text is None:
                 return
             self.emit("clean_state", "on")
-            cleaned, usage = llm_clean.clean(text)
+            cleaned, usage = llm_clean.agent(text) if self.mode == "agent" else llm_clean.clean(text)
             if not cleaned:
                 cleaned = text  # the clean failed: the raw transcript is the result
             self.emit("clean_all", cleaned)
@@ -277,7 +281,8 @@ async def handler(ws) -> None:
                 if ACTIVE is not None and not ACTIVE.done.is_set():
                     queue.put_nowait(("error", "another recording is still running or finishing; try again in a moment", None))
                     continue
-                session = ACTIVE = LiveSession(int(m.get("sample_rate", SR)), emit)
+                session = ACTIVE = LiveSession(int(m.get("sample_rate", SR)), emit,
+                                               mode=m.get("mode", "clean"))
             elif m.get("action") == "stop" and session is not None:
                 session.finish()
     finally:

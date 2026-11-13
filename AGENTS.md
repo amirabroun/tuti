@@ -1,14 +1,15 @@
 # tuti — agent knowledge
 
 Personal Persian dictation app for Amir (single user, macOS app only — no web UI, no auth).
-Speak → live ASR transcript → one LLM cleanup after stop → clipboard/history. Stage 3 mini
+Speak → live ASR transcript → one LLM pass after stop → clipboard/history. Stage 3 mini
 (voice commands) shipped 2026-11-09; stage 4 (final-only clean + live menu bar) 2026-11-10;
-a stronger agent is the known future direction.
+prompt mode (a «پرامپت» toggle swapping the LLM pass to agent.md) 2026-11-13; a stronger
+agent is the known future direction.
 
 ## Map
 
 - `swift/` — SwiftUI app: `App.swift` (window, cards, menu-bar dropdown), `TranscriptViewModel.swift`
-  (state, socket, mic, timers, card edit/delete/search), `SidecarManager.swift` (launches the
+  (state, socket, mic, timers, card delete/search), `SidecarManager.swift` (launches the
   server, owns the log), `HotkeyCenter.swift` (global ⌥Space + the paste-back ⌘V),
   `Actions.swift` (voice-command executor: Reminders/search/open URL), `Paragraphs.swift`
   (deterministic final-text paragrapher), `Permissions.swift` (Settings panel: permission
@@ -17,10 +18,13 @@ a stronger agent is the known future direction.
 - `server.py` — Python sidecar (PEP-723, `uv run`): ASR over WebSocket. Protocol v1 = the
   docstring at the top. Runs mehdi-hf/nemotron-asr-streaming-farsi offline from local caches.
 - `llm_clean.py` — LLM client, stdlib only; OpenAI + Anthropic dialects (Anthropic when
-  "anthropic" is in the base URL; thinking disabled). `clean()`/`intent()` return
-  `(result, (in_tokens, out_tokens))` and append every call to `llm_calls.jsonl`.
+  "anthropic" is in the base URL; thinking disabled). `clean()`/`agent()`/`intent()` return
+  `(result, (in_tokens, out_tokens))` and append every call to `llm_calls.jsonl`
+  (kind: clean/agent/intent).
 - `prompts/clean.md` — the cleanup system prompt (Amir's own text, 2026-11-09); re-read per
-  call. Raw text is sent wrapped in `<t>…</t>` (data, never a command). `prompts/intent.md` —
+  call. Raw text is sent wrapped in `<t>…</t>` (data, never a command). `prompts/agent.md` —
+  the prompt-mode system prompt (condense + English tech terms via Amir's glossary + agentify,
+  2026-11-13; his file now, change only on his ask). `prompts/intent.md` —
   the voice-command classifier (stage 3 mini, 2026-11-09).
 - `.env` — TUTI_LLM_BASE_URL / TUTI_LLM_MODEL / TUTI_LLM_API_KEY. Gitignored SECRET: never
   echo the key, never commit it. Empty = cleanup off (and no intent calls).
@@ -36,23 +40,28 @@ a stronger agent is the known future direction.
 
 Canonical app: `build/Build/Products/Debug/tuti.app` — the single copy on the machine.
 
-## Current behavior (2026-11-10)
+## Current behavior (2026-11-13)
 
 - Record/Stop = button or Space. NO LLM call mid-recording: the raw transcript streams live
-  (active card + menu bar); after stop the WHOLE transcript gets one clean and the result
+  (active card + menu bar); after stop the WHOLE transcript gets ONE LLM pass and the result
   replaces the card text. No style picker, no Re-clean, no History panel (removed
   2026-11-09 — cards ARE the history).
-- Auto-stop checkbox (default on): ~4 s of silence ends the recording → the one clean → history.
+- Prompt mode (2026-11-13): sticky «پرامپت» checkbox (status row) + menu-bar toggle. ON at
+  Record time → the post-stop pass is `llm_clean.agent()` (prompts/agent.md: condensed
+  agent prompt with English tech terms) instead of the clean; no verbatim clean exists in
+  that mode (card = agent text, «خام» flip = raw ASR). Mode is sent on the start frame
+  (`"mode":"agent"`, absent = clean) and fixed per recording; ⌥Space follows the same toggle.
+- Auto-stop checkbox (default on): ~4 s of silence ends the recording → the one pass → history.
 - Finished text is paragraphed deterministically (a break every 3 sentence enders, no LLM).
 - Main window = card list, one card per recording, click a card to copy. Launch loads the last
-  50 history entries as cards. Finished cards: pencil = inline edit (history rewritten),
-  «خام» = flip to the raw ASR text, trash = delete card + history entry (no confirm).
-  Search field filters cards by clean or raw text. Nothing is auto-deleted besides that;
-  empty recordings drop their blank card.
+  50 history entries as cards. Finished cards: «خام» chip (bordered, waveform/wand icon) =
+  flip to the raw ASR text, trash = delete card + history entry (no confirm, red on hover).
+  Inline card edit REMOVED 2026-11-13 (never used). Search field filters cards by clean or
+  raw text. Nothing is auto-deleted besides that; empty recordings drop their blank card.
 - Menu bar (app stays alive after the window closes; Quit lives there): icon alone shows the
   state — mic.fill + live word count while recording, wand.and.stars while the AI edits,
   waveform idle; dropdown adds the last ~60 chars heard while recording, status, record,
-  last 5 cards (click = copy), cumulative token usage, Launch at Login.
+  the «پرامپت» toggle, last 5 cards (click = copy), cumulative token usage, Launch at Login.
 - Global ⌥Space: record from any app; when the recording finishes it activates that app and
   pastes the result there. Recordings started in-window never paste.
 - Permissions asked together on the first launch (2026-11-10): the Settings panel opens once
@@ -104,7 +113,7 @@ Canonical app: `build/Build/Products/Debug/tuti.app` — the single copy on the 
   HotkeyCenter are raw ints (49=Space, 9=V) — kVK_* names don't resolve in this target.
 - Space (Record) is a local key monitor in TranscriptViewModel, NOT a button
   keyboardShortcut: a bare-Space SwiftUI shortcut also fires while a TextField has focus
-  (search, card edit would toggle the mic mid-typing).
+  (the search field would toggle the mic mid-typing).
 - The intent call appends «تاریخ امروز» to prompts/intent.md per call — the model has no
   clock; without it «فردا» cannot become an ISO date.
 - The ASR model loads fp16 on MPS (`dtype=torch.float16` in server.py main): ~3.5 GB → ~1.6 GB

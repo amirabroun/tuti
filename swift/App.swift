@@ -71,6 +71,7 @@ private struct MenuBarContent: View {
         Divider()
         Button(model.phase == .recording ? "Stop" : "Record") { model.uiToggleRecord() }
             .disabled(model.phase != .ready && model.phase != .recording)
+        Toggle("پرامپت", isOn: Bindable(model).promptMode)  // ⌥Space users switch mode without the window
         Divider()
         ForEach(model.cards.filter { $0.isFinal }.suffix(5).reversed()) { card in
             Button(menuTitle(card.text)) { model.copyText(card.text) }
@@ -127,6 +128,7 @@ struct ContentView: View {
                     Text(String(format: "%.0f dB", model.levelDb)).monospacedDigit()
                 }
                 Toggle("Auto-stop", isOn: Bindable(model).autoStop).toggleStyle(.checkbox)
+                Toggle("پرامپت", isOn: Bindable(model).promptMode).toggleStyle(.checkbox)
             }
             .font(.callout)
             .foregroundStyle(.secondary)
@@ -168,7 +170,6 @@ struct ContentView: View {
                                      partial: card.id == model.cards.last?.id && !card.isFinal
                                         ? model.partial : "",
                                      cleaning: model.cleaning,
-                                     onEdit: model.editCard,
                                      onDelete: model.deleteCard,
                                      onRunIntent: model.runIntent)
                                 .id(card.id)
@@ -225,23 +226,21 @@ struct ContentView: View {
     }
 }
 
-/// One dictation card: click to copy. Finished cards also carry edit / raw-view / delete
-/// buttons and, when the transcript parsed as a command, an action chip. The active
-/// recording card shows the live partial and the AI round-trip (pulsing dot + progress bar).
+/// One dictation card: click to copy. Finished cards also carry raw-view / delete buttons
+/// and, when the transcript parsed as a command, an action chip. The active recording card
+/// shows the live partial and the AI round-trip (pulsing dot + progress bar).
 struct CardView: View {
     let card: Card
     let isActive: Bool
     let partial: String
     let cleaning: Bool
-    var onEdit: (UUID, String) -> Void
     var onDelete: (UUID) -> Void
     var onRunIntent: (UUID) -> Void
 
     @State private var copied = false
     @State private var pulse = false
-    @State private var editing = false
-    @State private var draft = ""
     @State private var showRaw = false
+    @State private var trashHover = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -258,16 +257,7 @@ struct CardView: View {
                 if card.isFinal { controls }
                 Text(copied ? "copied ✓" : card.ts).font(.caption2).foregroundStyle(.secondary)
             }
-            if editing {
-                TextField("text", text: $draft, axis: .vertical)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { commitEdit() }
-                HStack {
-                    Button("Save") { commitEdit() }
-                    Button("Cancel") { editing = false }
-                }
-                .controlSize(.small)
-            } else if !display.isEmpty {
+            if !display.isEmpty {
                 Text(display).multilineTextAlignment(.leading)
             }
             if card.isFinal, let action = card.intent {
@@ -313,27 +303,31 @@ struct CardView: View {
         return card.text
     }
 
+    /// Raw flip = a mini bordered chip in the app's own icon language (waveform = the raw
+    /// ASR, wand = the final text — neutral wording: in prompt mode the final text is an
+    /// agent prompt, not an edited one). Delete stays one click (his call, no confirm):
+    /// calm gray at rest, red only on hover.
     private var controls: some View {
-        HStack(spacing: 2) {
-            Button { draft = card.text; editing = true } label: {
-                Image(systemName: "pencil")
-            }
+        HStack(spacing: 8) {
             if let raw = card.raw, !raw.isEmpty, raw != card.text {
                 Button { showRaw.toggle() } label: {
-                    Text(showRaw ? "ویراست" : "خام")
+                    Label(showRaw ? "نهایی" : "خام",
+                          systemImage: showRaw ? "wand.and.stars" : "waveform")
                 }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+                .help(showRaw ? "نمایش متن نهایی" : "نمایش متن خام ASR")
             }
             Button { onDelete(card.id) } label: {
                 Image(systemName: "trash")
+                    .frame(minWidth: 20, minHeight: 20)  // a hit area bigger than the glyph
+                    .contentShape(.rect)
             }
+            .buttonStyle(.borderless)
+            .foregroundStyle(trashHover ? .red : .secondary)
+            .onHover { trashHover = $0 }
+            .help("حذف کارت")
         }
-        .buttonStyle(.borderless)
         .font(.caption2)
-        .foregroundStyle(.secondary)
-    }
-
-    private func commitEdit() {
-        editing = false
-        onEdit(card.id, draft)
     }
 }

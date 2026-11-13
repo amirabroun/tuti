@@ -2,7 +2,7 @@ import AppKit
 import Observation
 
 /// One resolved recording in the history file: the raw ASR text and, when cleaning worked, the clean text.
-/// `id` exists since 2026-11-09 (edits/deletes find the line again); old lines match by ts+raw.
+/// `id` exists since 2026-11-09 (deletes find the line again); old lines match by ts+raw.
 struct HistoryEntry: Codable {
     let id: UUID?
     let ts: String
@@ -59,6 +59,9 @@ final class TranscriptViewModel {
     private(set) var llmClean = false
     var searchQuery = ""
     var autoStop: Bool { didSet { UserDefaults.standard.set(autoStop, forKey: "autoStop") } }
+    /// ON = this recording's LLM pass rewrites the transcript as a coding-agent prompt
+    /// (server mode "agent") instead of cleaning it. Sticky like autoStop; read at Record.
+    var promptMode: Bool { didSet { UserDefaults.standard.set(promptMode, forKey: "promptMode") } }
 
     var visibleCards: [Card] {
         guard !searchQuery.isEmpty else { return cards }
@@ -95,6 +98,7 @@ final class TranscriptViewModel {
     init() {
         let d = UserDefaults.standard
         autoStop = (d.object(forKey: "autoStop") as? Bool) ?? true
+        promptMode = (d.object(forKey: "promptMode") as? Bool) ?? false
     }
 
     func appStart() {
@@ -118,7 +122,7 @@ final class TranscriptViewModel {
         hotkey?.onToggle = { [weak self] in Task { @MainActor in self?.hotkeyToggleRecord() } }
         hotkey?.start()
         // Space toggles Record — claimed only when nothing else has focus: a text view
-        // first responder (search field, card edit) keeps its spaces.
+        // first responder (the search field) keeps its spaces.
         spaceMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             MainActor.assumeIsolated {
                 guard let self,
@@ -167,8 +171,10 @@ final class TranscriptViewModel {
             finalRaw = nil
             copied = false
             cards.append(Card(ts: stamp()))
-            socket.send(["v": 1, "type": "control", "action": "start",
-                         "sample_rate": mic.sampleRate])
+            var start: [String: Any] = ["v": 1, "type": "control", "action": "start",
+                                        "sample_rate": mic.sampleRate]
+            if promptMode { start["mode"] = "agent" }  // absent = clean (old servers ignore it)
+            socket.send(start)
             phase = .recording
             scheduleAutoStop()
         case .recording:
@@ -204,19 +210,6 @@ final class TranscriptViewModel {
         guard let data = try? Data(contentsOf: Config.historyURL) else { return [] }
         return data.split(separator: UInt8(ascii: "\n"))
             .compactMap { try? JSONDecoder().decode(HistoryEntry.self, from: $0) }
-    }
-
-    /// Saves an edited card: the history line gets the new text as its clean (the raw stays original).
-    func editCard(_ id: UUID, to text: String) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let idx = cards.firstIndex(where: { $0.id == id }) else { return }
-        let ts = cards[idx].ts, raw = cards[idx].raw
-        cards[idx].text = trimmed
-        rewriteHistory { entries in
-            for i in entries.indices where entries[i].matches(id: id, ts: ts, raw: raw) {
-                entries[i].clean = trimmed
-            }
-        }
     }
 
     func deleteCard(_ id: UUID) {
