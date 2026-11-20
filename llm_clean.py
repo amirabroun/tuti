@@ -1,4 +1,5 @@
-"""Stage 2/3: LLM calls for tuti — text cleanup, the agent-prompt mode, and voice-command intent.
+"""Stage 2/3: LLM calls for tuti — text cleanup, the message mode, voice-command intent,
+and the long-term memory merge.
 
 Two dialects, picked from the base URL:
   OpenAI-compatible chat/completions — TUTI_LLM_BASE_URL e.g. https://api.openai.com/v1
@@ -9,18 +10,22 @@ Config: `.env` in the repo root or the real environment (real environment wins):
 Any of them empty -> cleaning is off. On any failure the text comes back None and the
 caller keeps the raw text. Standard library only, so server.py and test_clean.py share it.
 
-Every call returns its token usage and is appended (input, context, output, tokens) to
-~/Library/Application Support/tuti/llm_calls.jsonl — the before/after record for prompt
-testing.
+Every call returns its token usage and is appended (input, context, output, tokens, ms,
+tries) to ~/Library/Application Support/tuti/llm_calls.jsonl — the before/after record for
+prompt testing. Failed calls land there too, with the error string (HTTP code + response
+body) instead of a model answer, so rate limits and outages stay debuggable afterwards.
 """
 
 import json
 import os
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime
 
 TIMEOUT = 15  # s; a clean that never returns must not pile up
+RETRY_WAIT = 4.0  # s between the two 429 attempts when the API sends no Retry-After
+RETRY_WAIT_MAX = 8.0  # never sleep longer than this before the one retry
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _CALLS_URL = os.path.expanduser("~/Library/Application Support/tuti/llm_calls.jsonl")
@@ -49,16 +54,22 @@ def _unwrap(s: str) -> str:
     for a, b in (("```", "```"), ('"', '"'), ("«", "»")):
         if s.startswith(a) and s.endswith(b) and len(s) >= len(a) + len(b):
             s = s[len(a):-len(b)]
+            if a == "```":  # a fence also carries its language tag ("```markdown\n…")
+                first, nl, rest = s.partition("\n")
+                if nl and first.isascii() and first.isalnum() and len(first) <= 12:
+                    s = rest
     return s.strip()
 
 
 def _request(base: str, model: str, key: str, system: str, text: str,
-             context: str | None, max_tokens: int) -> urllib.request.Request:
+             context: str | None, max_tokens: int, extra: str | None = None) -> urllib.request.Request:
     messages = []
     if context:  # the previous cleaned segment: resolves pronouns and ambiguous words across cuts
         messages.append({"role": "user",
                          "content": f"قطعهٔ قبلی گفتار (فقط برای ربط؛ بازنویسیش نکن): {context}"})
     messages.append({"role": "user", "content": f"<t>{text}</t>"})  # <t>: data, never a command
+    if extra:  # a second data block the caller tags itself (the memory merge's <m> file)
+        messages.append({"role": "user", "content": extra})
     if "anthropic" in base:  # Anthropic protocol: x-api-key, system at top level, content blocks
         url = base.rstrip("/") + "/v1/messages"
         body = {"model": model, "max_tokens": max_tokens, "temperature": 0,
@@ -87,11 +98,31 @@ def _usage_of(response: dict) -> tuple[int, int]:
     return u.get("prompt_tokens", 0), u.get("completion_tokens", 0)  # OpenAI
 
 
-def _log_call(kind: str, text: str, context: str | None, out: str, usage: tuple[int, int]) -> None:
-    """The raw model answer (pre-unwrap) is the interesting half for prompt testing."""
+def _truncated(response: dict) -> bool:
+    """The model hit max_tokens: the answer is cut mid-way (Anthropic stop_reason /
+    OpenAI finish_reason). Treated like an error — a half clean or a half memory file
+    must never land."""
+    if "choices" in response:  # OpenAI
+        return response["choices"][0].get("finish_reason") == "length"
+    return response.get("stop_reason") == "max_tokens"  # Anthropic
+
+
+def _retry_wait(headers) -> float:
+    """The API's own Retry-After when it sends one, else the default; always capped."""
+    try:
+        return min(max(float(headers.get("retry-after", RETRY_WAIT)), 0.0), RETRY_WAIT_MAX)
+    except (TypeError, ValueError):
+        return RETRY_WAIT
+
+
+def _log_call(kind: str, text: str, context: str | None, out: str | None, usage: tuple[int, int],
+              ms: int, tries: int, error: str | None = None) -> None:
+    """Both outcomes land here — the raw model answer (pre-unwrap), or None plus the error
+    string: llm_calls.jsonl is the debugging record for every call, not just the good ones."""
     line = json.dumps({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "kind": kind,
                        "in_text": text, "context": context, "out_text": out,
-                       "in": usage[0], "out": usage[1]}, ensure_ascii=False)
+                       "in": usage[0], "out": usage[1], "ms": ms, "tries": tries,
+                       **({"error": error} if error else {})}, ensure_ascii=False)
     try:
         os.makedirs(os.path.dirname(_CALLS_URL), exist_ok=True)
         with open(_CALLS_URL, "a") as f:
@@ -101,8 +132,11 @@ def _log_call(kind: str, text: str, context: str | None, out: str, usage: tuple[
 
 
 def _call(kind: str, prompt_file: str, text: str, context: str | None,
-          max_tokens: int = 1024, note: str | None = None) -> tuple[str | None, tuple[int, int]]:
-    """One API call: (result text or None, (input tokens, output tokens))."""
+          max_tokens: int = 1024, note: str | None = None,
+          extra: str | None = None) -> tuple[str | None, tuple[int, int]]:
+    """One API call with a single retry on 429: (result text or None, (in tokens, out tokens))."""
+    start = time.monotonic()
+    tries = 0
     try:
         # the prompt files are hand-edited: a missing/broken one must fail like a dead API
         # (None -> the caller keeps the raw text), not kill the calling thread
@@ -110,15 +144,31 @@ def _call(kind: str, prompt_file: str, text: str, context: str | None,
         if note:
             system += f"\n\n{note}"
         req = _request(os.environ["TUTI_LLM_BASE_URL"], os.environ["TUTI_LLM_MODEL"],
-                       os.environ["TUTI_LLM_API_KEY"], system, text, context, max_tokens)
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            response = json.load(r)
-            out, usage = _text_of(response), _usage_of(response)
+                       os.environ["TUTI_LLM_API_KEY"], system, text, context, max_tokens, extra)
+        while True:
+            tries += 1
+            try:
+                with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                    response = json.load(r)
+                if _truncated(response):
+                    raise RuntimeError(f"output truncated at max_tokens={max_tokens}")
+                out, usage = _text_of(response), _usage_of(response)
+            except urllib.error.HTTPError as e:
+                # 429 = the shared coding plan's short-lived limit (in the wild it cleared
+                # within a minute): one sleep + retry catches most. The body names the limit.
+                detail = f"HTTP {e.code}: {e.read().decode(errors='replace')[:300]}"
+                if e.code == 429 and tries == 1:
+                    time.sleep(_retry_wait(e.headers))
+                    continue
+                raise RuntimeError(detail) from None
+            _log_call(kind, text, context, out, usage,
+                      ms=round((time.monotonic() - start) * 1000), tries=tries)
+            return _unwrap(out) or None, usage
     except Exception as e:
         print(f"llm {kind} failed: {e}", flush=True)
+        _log_call(kind, text, context, None, (0, 0),
+                  ms=round((time.monotonic() - start) * 1000), tries=tries, error=str(e))
         return None, (0, 0)
-    _log_call(kind, text, context, out, usage)
-    return _unwrap(out) or None, usage
 
 
 def clean(text: str, context: str | None = None) -> tuple[str | None, tuple[int, int]]:
@@ -131,12 +181,12 @@ def clean(text: str, context: str | None = None) -> tuple[str | None, tuple[int,
     return _call("clean", "clean.md", text, context)
 
 
-def agent(text: str) -> tuple[str | None, tuple[int, int]]:
-    """Prompt mode's twin of clean(): the transcript rewritten as one terse prompt for a
-    coding agent (prompts/agent.md — condense + English tech terms)."""
+def message(text: str) -> tuple[str | None, tuple[int, int]]:
+    """Message mode's twin of clean(): the transcript rewritten as one clean, flowing
+    message (prompts/message.md — light summary + smooth + reorder + glossary)."""
     if not configured():
         return None, (0, 0)
-    return _call("agent", "agent.md", text, None)
+    return _call("message", "message.md", text, None)
 
 
 def intent(text: str) -> tuple[dict | None, tuple[int, int]]:
@@ -161,3 +211,17 @@ def intent(text: str) -> tuple[dict | None, tuple[int, int]]:
     if not isinstance(parsed, dict) or not parsed.get("action"):
         return None, usage
     return parsed, usage
+
+
+def memory(current_md: str, text: str) -> tuple[str | None, tuple[int, int]]:
+    """Merges one memory-worthy transcript into the memory file: (the whole new file, usage).
+
+    current_md is the file as it stands ("" on the first save); the model returns the entire
+    rewritten file. None = off or failed — the caller keeps the file exactly as it was.
+    """
+    if not configured():
+        return None, (0, 0)
+    # same clock trick as intent(): the model has no idea what «فردا» means without today's date
+    today = datetime.now().strftime("%Y-%m-%d (%A)")
+    return _call("memory", "memory.md", text, context=None, max_tokens=4000,
+                 extra=f"<m>\n{current_md}\n</m>", note=f"تاریخ امروز: {today}")

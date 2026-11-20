@@ -3,13 +3,18 @@ import Observation
 
 /// One resolved recording in the history file: the raw ASR text and, when cleaning worked, the clean text.
 /// `id` exists since 2026-11-09 (deletes find the line again); old lines match by ts+raw.
+/// `fallback`/`mode` exist since 2026-11-18 (the manual retry): old lines decode them as nil.
+/// `memory` exists since 2026-11-20 (the auto memory merge): old lines decode it as nil.
 struct HistoryEntry: Codable {
     let id: UUID?
     let ts: String
     let raw: String
     var clean: String?
+    var fallback: Bool?
+    var mode: String?
+    var memory: Bool?
 
-    enum CodingKeys: String, CodingKey { case id, ts, raw, clean }
+    enum CodingKeys: String, CodingKey { case id, ts, raw, clean, fallback, mode, memory }
 
     func matches(id: UUID, ts: String, raw: String?) -> Bool {
         if let own = self.id { return own == id }
@@ -26,13 +31,20 @@ struct Card: Identifiable {
     var isFinal = false
     var intent: DictationAction?  // a parsed voice command, run only when its chip is clicked
     var intentDone = false
+    var fallback = false  // the LLM pass returned nothing: text is raw, the retry chip shows
+    var mode: String?  // the recording's LLM pass ("message" / nil = clean), resent on retry
+    var memorySaved = false  // the server merged this recording into the memory file (passive chip)
 
-    init(id: UUID = UUID(), ts: String, text: String = "", raw: String? = nil, isFinal: Bool = false) {
+    init(id: UUID = UUID(), ts: String, text: String = "", raw: String? = nil, isFinal: Bool = false,
+         fallback: Bool = false, mode: String? = nil, memorySaved: Bool = false) {
         self.id = id
         self.ts = ts
         self.text = text
         self.raw = raw
         self.isFinal = isFinal
+        self.fallback = fallback
+        self.mode = mode
+        self.memorySaved = memorySaved
     }
 }
 
@@ -52,6 +64,11 @@ final class TranscriptViewModel {
     private(set) var copied = false
     private(set) var serverFailed = false
     private(set) var cleaning = false
+    /// Cards with a manual re-clean in flight (the «تلاش دوباره» chip becomes a spinner).
+    private(set) var retryingIds: Set<UUID> = []
+    /// The server's "fallback" flag on clean_all: the LLM pass returned nothing and the text
+    /// is raw — the HUD says so instead of a plain «کپی شد».
+    private var cleanFailed = false
     private(set) var tokensIn = 0  // cumulative LLM tokens the server reports after each call
     private(set) var tokensOut = 0
     private(set) var llmModel = ""   // the config the server actually loaded (Settings panel);
@@ -59,9 +76,10 @@ final class TranscriptViewModel {
     private(set) var llmClean = false
     var searchQuery = ""
     var autoStop: Bool { didSet { UserDefaults.standard.set(autoStop, forKey: "autoStop") } }
-    /// ON = this recording's LLM pass rewrites the transcript as a coding-agent prompt
-    /// (server mode "agent") instead of cleaning it. Sticky like autoStop; read at Record.
-    var promptMode: Bool { didSet { UserDefaults.standard.set(promptMode, forKey: "promptMode") } }
+    /// ON = this recording's LLM pass rewrites the transcript as one clean, flowing
+    /// message (server mode "message") instead of a plain clean. Sticky like autoStop;
+    /// read at Record.
+    var messageMode: Bool { didSet { UserDefaults.standard.set(messageMode, forKey: "messageMode") } }
 
     var visibleCards: [Card] {
         guard !searchQuery.isEmpty else { return cards }
@@ -98,14 +116,18 @@ final class TranscriptViewModel {
     init() {
         let d = UserDefaults.standard
         autoStop = (d.object(forKey: "autoStop") as? Bool) ?? true
-        promptMode = (d.object(forKey: "promptMode") as? Bool) ?? false
+        messageMode = (d.object(forKey: "messageMode") as? Bool) ?? false
     }
 
     func appStart() {
         guard !started else { return }
         started = true
         cards = loadHistory().suffix(50)  // past recordings show as cards from the start
-            .map { Card(id: $0.id ?? UUID(), ts: $0.ts, text: $0.clean ?? $0.raw, raw: $0.raw, isFinal: true) }
+            .map { Card(id: $0.id ?? UUID(), ts: $0.ts, text: $0.clean ?? $0.raw, raw: $0.raw,
+                        isFinal: true,
+                        // pre-2026-11-18 lines carry no flag: clean == raw is the fallback signature
+                        fallback: $0.fallback ?? ($0.clean != nil && $0.clean == $0.raw),
+                        mode: $0.mode, memorySaved: $0.memory ?? false) }
         socket.onConnectionChange = { [weak self] connected in self?.connectionChanged(connected) }
         socket.onMessage = { [weak self] message in self?.handle(message) }
         sidecar.onExit = { [weak self] reason in
@@ -170,10 +192,10 @@ final class TranscriptViewModel {
             partial = ""
             finalRaw = nil
             copied = false
-            cards.append(Card(ts: stamp()))
+            cards.append(Card(ts: stamp(), mode: messageMode ? "message" : nil))
             var start: [String: Any] = ["v": 1, "type": "control", "action": "start",
                                         "sample_rate": mic.sampleRate]
-            if promptMode { start["mode"] = "agent" }  // absent = clean (old servers ignore it)
+            if messageMode { start["mode"] = "message" }  // absent = clean (old servers ignore it)
             socket.send(start)
             phase = .recording
             scheduleAutoStop()
@@ -218,6 +240,17 @@ final class TranscriptViewModel {
         rewriteHistory { entries in
             entries.removeAll { $0.matches(id: card.id, ts: card.ts, raw: card.raw) }
         }
+    }
+
+    /// The «تلاش دوباره» chip on a fallback card: re-run the LLM pass on that recording's
+    /// raw text, in the mode it was recorded in (old cards take the current toggle). The
+    /// clipboard is not touched — the card click that follows copies.
+    func retryClean(_ id: UUID) {
+        guard let idx = cards.firstIndex(where: { $0.id == id }),
+              let raw = cards[idx].raw, !raw.isEmpty, !retryingIds.contains(id) else { return }
+        retryingIds.insert(id)
+        socket.send(["v": 1, "type": "retry", "id": id.uuidString, "text": raw,
+                     "mode": cards[idx].mode ?? (messageMode ? "message" : "clean")])
     }
 
     /// Runs a card's parsed voice command (stage 3): the chip was clicked. The osascript can
@@ -276,9 +309,10 @@ final class TranscriptViewModel {
         case "clean_all":
             // the cleaned whole transcript, once, after stop
             cleaning = false
+            cleanFailed = message["fallback"] as? Bool ?? false
             if dropDeletedRecording() { return }
             if let text = message["text"] as? String, !text.isEmpty {
-                updateLastCard { $0.text = text }
+                updateLastCard { $0.text = text; $0.fallback = cleanFailed }
             }
             if let raw = finalRaw {
                 finalRaw = nil
@@ -288,6 +322,23 @@ final class TranscriptViewModel {
                 maybePaste()
             }
             phase = .ready
+        case "cleaned":
+            // a manual retry resolved: swap that card's text (anywhere in the list) and its
+            // history line. Still failed = the flag stays, the chip offers another try.
+            guard let id = (message["id"] as? String).flatMap(UUID.init(uuidString:)),
+                  let text = message["text"] as? String else { return }
+            retryingIds.remove(id)
+            let failedAgain = message["fallback"] as? Bool ?? false
+            guard let idx = cards.firstIndex(where: { $0.id == id }) else { return }
+            cards[idx].fallback = failedAgain
+            if !failedAgain, !text.isEmpty {
+                cards[idx].text = paragraphs(text)
+            }
+            updateHistory(cards[idx]) { entry in
+                entry.fallback = failedAgain
+                if !failedAgain, !text.isEmpty { entry.clean = text }
+                if entry.mode == nil { entry.mode = cards[idx].mode }
+            }
         case "usage":
             tokensIn = message["in"] as? Int ?? tokensIn
             tokensOut = message["out"] as? Int ?? tokensOut
@@ -301,6 +352,14 @@ final class TranscriptViewModel {
                let idx = cards.lastIndex(where: { $0.isFinal }) {
                 cards[idx].intent = action
                 cards[idx].intentDone = false
+            }
+        case "memory_saved":
+            // the server merged the just-finished recording into the memory file. The chip
+            // is pure notification — nothing to click, nothing runs. Same last-final-card
+            // rule as intent (a card deleted mid-flight can drop the flag onto none).
+            if let idx = cards.lastIndex(where: { $0.isFinal }) {
+                cards[idx].memorySaved = true
+                updateHistory(cards[idx]) { $0.memory = true }
             }
         case "asr_final":
             // terminator: the one clean (clean_all, or clean_state off) may still arrive
@@ -351,6 +410,8 @@ final class TranscriptViewModel {
         updateLastCard { $0.text = text; $0.raw = raw; $0.isFinal = true }
         saveHistory(raw, clean: clean)
         copyToPasteboard(text)
+        CopyHud.show(text: text, failed: cleanFailed)
+        cleanFailed = false
         maybePaste()
     }
 
@@ -387,15 +448,18 @@ final class TranscriptViewModel {
 
     /// One JSONL line per resolved segment; the POSIX locale keeps the stamp ASCII whatever the system locale is.
     private func saveHistory(_ raw: String, clean: String?) {
-        guard let id = cards.last?.id else { return }
+        guard let card = cards.last else { return }
         do {
             try FileManager.default.createDirectory(at: Config.historyURL.deletingLastPathComponent(),
                                                     withIntermediateDirectories: true)
             let formatter = DateFormatter()
             formatter.locale = Locale(identifier: "en_US_POSIX")
             formatter.dateFormat = "yyyy-MM-dd HH:mm"
-            let line = try JSONEncoder().encode(HistoryEntry(id: id, ts: formatter.string(from: Date()),
-                                                             raw: raw, clean: clean)) + Data("\n".utf8)
+            let line = try JSONEncoder().encode(HistoryEntry(id: card.id, ts: formatter.string(from: Date()),
+                                                             raw: raw, clean: clean,
+                                                             fallback: card.fallback ? true : nil,
+                                                             mode: card.mode,
+                                                             memory: card.memorySaved ? true : nil)) + Data("\n".utf8)
             if FileManager.default.fileExists(atPath: Config.historyURL.path) {
                 let handle = try FileHandle(forWritingTo: Config.historyURL)
                 try handle.seekToEnd()
@@ -419,6 +483,16 @@ final class TranscriptViewModel {
                 .write(to: Config.historyURL, options: .atomic)
         } catch {
             lastError = "Could not rewrite history: \(error.localizedDescription)"
+        }
+    }
+
+    /// Updates one card's history line in place (a retry resolving). Id matches where there
+    /// is one; the oldest pre-id lines fall back to ts+raw, same rule as deletes.
+    private func updateHistory(_ card: Card, _ mutate: (inout HistoryEntry) -> Void) {
+        rewriteHistory { entries in
+            if let i = entries.firstIndex(where: { $0.matches(id: card.id, ts: card.ts, raw: card.raw) }) {
+                mutate(&entries[i])
+            }
         }
     }
 

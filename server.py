@@ -8,11 +8,16 @@
 
 Protocol v1 -- JSON text frames (real unicode), binary audio frames:
   app -> server   {"v":1,"type":"control","action":"start","sample_rate":48000}
-                  optional "mode":"agent" — the post-stop LLM pass rewrites the transcript
-                  as a terse coding-agent prompt (prompts/agent.md) instead of cleaning it
-                  (prompts/clean.md); absent = clean. Read once, at start.
+                  optional "mode":"message" — the post-stop LLM pass rewrites the transcript
+                  as one clean, flowing message (prompts/message.md: light summary + smooth
+                  + reorder) instead of a plain clean (prompts/clean.md); absent = clean.
+                  Read once, at start.
                   binary: float32 mono PCM at that sample rate (resampled here)
                   {"v":1,"type":"control","action":"stop"}
+                  {"v":1,"type":"retry","id":"<card uuid>","text":"<raw>","mode":"message"?}
+                                                               a manual re-clean of an old
+                                                               recording (the mode it was
+                                                               recorded in; absent = clean)
   server -> app   {"v":1,"type":"asr_partial","text":"..."}   the whole raw transcript so far; the
                                                                LLM is never called mid-recording
                   {"v":1,"type":"clean_state","on":true}      the final clean started ("Editing...")
@@ -21,8 +26,16 @@ Protocol v1 -- JSON text frames (real unicode), binary audio frames:
                                                                nothing was said)
                   {"v":1,"type":"clean_all","text":"..."}     the whole transcript, cleaned — once,
                                                                after stop. Only when .env is filled in.
+                                                               optional "fallback":true = the LLM call
+                                                               returned nothing; text is the raw
+                                                               transcript (the app's HUD says so)
                   {"v":1,"type":"asr_final","text":"..."}     the whole raw recording, once, after
                                                                stop; a terminator, not a line
+                  {"v":1,"type":"cleaned","id":"...","text":"..."}
+                                                               the manual retry's result, for
+                                                               that card id; optional
+                                                               "fallback":true = it failed
+                                                               again. No intent re-run.
                   {"v":1,"type":"usage","in":N,"out":N}      cumulative LLM tokens since the
                                                                server start, after every LLM call
                   {"v":1,"type":"config","model":"...","base_url":"...","clean":true}
@@ -36,6 +49,13 @@ Protocol v1 -- JSON text frames (real unicode), binary audio frames:
                                                                Sent only when cleaning is on and the
                                                                transcript IS a command; the app runs
                                                                it on a click, never automatically.
+                                                               {"action":"memory"} never reaches the
+                                                               app: the server consumes it as the
+                                                               memory-worthy flag and merges the
+                                                               transcript into MEMORY_PATH itself
+                  {"v":1,"type":"memory_saved"}              that merge landed on disk — the app
+                                                               only shows a passive «حفظ شد» chip;
+                                                               sent after the file write succeeded
                   {"v":1,"type":"error","message":"..."}
 The socket only opens once the model is loaded, so "connected" means "ready".
 Connections that send an Origin header (web pages in a browser) are refused with HTTP 403.
@@ -66,6 +86,9 @@ SR = 16000
 DEFAULT_MODEL = "mehdi-hf/nemotron-asr-streaming-farsi"
 LOOKAHEAD_TOKENS = 13  # 1.1 s of right context: the ASR repo's most accurate setting
 IDLE_TIMEOUT = 10.0  # s without audio before a recording is closed (app killed mid-recording)
+# the long-term memory the app keeps for Amir (the «حفظ شد» chip points here)
+MEMORY_PATH = os.path.expanduser("~/Documents/tuti-memory/memory.md")
+MEMORY_LOCK = threading.Lock()  # one merge at a time: back-to-back memory-worthy recordings race otherwise
 
 MODEL = PROCESSOR = None
 MODEL_LOCK = threading.Lock()  # one transcription at a time (shared model and processor settings)
@@ -133,15 +156,57 @@ class LiveSession:
             if text is None:
                 return
             self.emit("clean_state", "on")
-            cleaned, usage = llm_clean.agent(text) if self.mode == "agent" else llm_clean.clean(text)
-            if not cleaned:
+            cleaned, usage = llm_clean.message(text) if self.mode == "message" else llm_clean.clean(text)
+            fallback = not cleaned
+            if fallback:
                 cleaned = text  # the clean failed: the raw transcript is the result
-            self.emit("clean_all", cleaned)
+            self.emit("clean_all", cleaned, {"fallback": True} if fallback else None)
             self._count(usage)
             parsed, usage = llm_clean.intent(cleaned)
             self._count(usage)
-            if parsed and parsed.get("action") not in (None, "", "none"):
+            action = parsed.get("action") if parsed else None
+            if action == "memory":
+                self._remember(cleaned)
+            elif parsed and action not in (None, "", "none"):
                 self.emit("intent", "", parsed)
+
+    def _remember(self, text: str) -> None:
+        """The transcript was memory-worthy: merge it into MEMORY_PATH (prompts/memory.md
+        returns the whole rewritten file). Fully automatic — no app round-trip first; the
+        chip is only told AFTER the file is safely on disk. A failure here touches nothing
+        (the file stays as it was, no chip, the recording is long since done). The lock
+        serializes merges: two memory-worthy recordings in a row would otherwise race on
+        the same file and silently drop one merge."""
+        with MEMORY_LOCK:
+            current = ""
+            if os.path.exists(MEMORY_PATH):
+                try:
+                    with open(MEMORY_PATH) as f:
+                        current = f.read()
+                except OSError as e:
+                    print(f"memory read failed: {e}", flush=True)
+                    return
+            else:
+                try:
+                    os.makedirs(os.path.dirname(MEMORY_PATH), exist_ok=True)
+                except OSError as e:
+                    print(f"memory mkdir failed: {e}", flush=True)
+                    return
+            merged, usage = llm_clean.memory(current, text)
+            self._count(usage)
+            if not merged or merged == current:
+                return  # failed, or the model judged the file already covers it
+            try:
+                with open(MEMORY_PATH + ".tmp", "w") as f:
+                    f.write(merged)
+                if current:  # the previous version survives one bad merge day
+                    with open(MEMORY_PATH + ".bak", "w") as f:
+                        f.write(current)
+                os.replace(MEMORY_PATH + ".tmp", MEMORY_PATH)
+            except OSError as e:
+                print(f"memory write failed: {e}", flush=True)
+                return
+            self.emit("memory_saved", "")
 
     def _count(self, usage: tuple[int, int]) -> None:
         self.tok_in += usage[0]
@@ -244,12 +309,27 @@ async def _sender(ws, queue: asyncio.Queue) -> None:
             msg["message"] = text
         elif kind == "clean_state":
             msg["on"] = text == "on"
-        elif kind in ("usage", "intent", "config"):
+        elif kind in ("usage", "intent", "config", "memory_saved"):
             pass  # every field lives in extra
         else:
             msg["text"] = text
         msg.update(extra or {})
         await ws.send(json.dumps(msg, ensure_ascii=False))
+
+
+def _re_clean(emit, m: dict) -> None:
+    """A manual retry from the app: the one LLM pass re-run on an old recording's raw text,
+    in a thread (the asyncio loop must not wait on the API). No intent re-run — that chip
+    is long gone by the time a retry is clicked."""
+    text = m.get("text", "")
+    cleaned, usage = (llm_clean.message(text) if m.get("mode") == "message"
+                      else llm_clean.clean(text))
+    extra = {"id": m.get("id", "")}
+    if not cleaned:
+        cleaned, extra["fallback"] = text, True
+    emit("cleaned", cleaned, extra)
+    if usage != (0, 0):
+        emit("usage", "", {"in": usage[0], "out": usage[1]})
 
 
 async def handler(ws) -> None:
@@ -275,6 +355,9 @@ async def handler(ws) -> None:
                     session.feed(np.frombuffer(msg, dtype=np.float32))
                 continue
             m = json.loads(msg)
+            if m.get("type") == "retry":
+                Thread(target=_re_clean, args=(emit, m), daemon=True).start()
+                continue
             if m.get("type") != "control":
                 continue
             if m.get("action") == "start":
