@@ -71,7 +71,7 @@ private struct MenuBarContent: View {
         Divider()
         Button(model.phase == .recording ? "Stop" : "Record") { model.uiToggleRecord() }
             .disabled(model.phase != .ready && model.phase != .recording)
-        Toggle("پرامپت", isOn: Bindable(model).promptMode)  // ⌥Space users switch mode without the window
+        Toggle("پیام", isOn: Bindable(model).messageMode)  // ⌥Space users switch mode without the window
         Divider()
         ForEach(model.cards.filter { $0.isFinal }.suffix(5).reversed()) { card in
             Button(menuTitle(card.text)) { model.copyText(card.text) }
@@ -128,7 +128,7 @@ struct ContentView: View {
                     Text(String(format: "%.0f dB", model.levelDb)).monospacedDigit()
                 }
                 Toggle("Auto-stop", isOn: Bindable(model).autoStop).toggleStyle(.checkbox)
-                Toggle("پرامپت", isOn: Bindable(model).promptMode).toggleStyle(.checkbox)
+                Toggle("پیام", isOn: Bindable(model).messageMode).toggleStyle(.checkbox)
             }
             .font(.callout)
             .foregroundStyle(.secondary)
@@ -170,8 +170,10 @@ struct ContentView: View {
                                      partial: card.id == model.cards.last?.id && !card.isFinal
                                         ? model.partial : "",
                                      cleaning: model.cleaning,
+                                     retrying: model.retryingIds.contains(card.id),
                                      onDelete: model.deleteCard,
-                                     onRunIntent: model.runIntent)
+                                     onRunIntent: model.runIntent,
+                                     onRetry: model.retryClean)
                                 .id(card.id)
                         }
                     }
@@ -234,8 +236,10 @@ struct CardView: View {
     let isActive: Bool
     let partial: String
     let cleaning: Bool
+    var retrying: Bool
     var onDelete: (UUID) -> Void
     var onRunIntent: (UUID) -> Void
+    var onRetry: (UUID) -> Void
 
     @State private var copied = false
     @State private var pulse = false
@@ -304,11 +308,31 @@ struct CardView: View {
     }
 
     /// Raw flip = a mini bordered chip in the app's own icon language (waveform = the raw
-    /// ASR, wand = the final text — neutral wording: in prompt mode the final text is an
-    /// agent prompt, not an edited one). Delete stays one click (his call, no confirm):
-    /// calm gray at rest, red only on hover.
+    /// ASR, wand = the final text — neutral wording: in message mode the final text is a
+    /// rewritten message, not an edited one). A failed LLM pass gets the same chip language:
+    /// «تلاش دوباره» re-runs the pass (spinner while in flight). Delete stays one click
+    /// (his call, no confirm): calm gray at rest, red only on hover.
     private var controls: some View {
         HStack(spacing: 8) {
+            if card.memorySaved {
+                // pure notification — the server already wrote the file, nothing to click
+                Label("حفظ شد", systemImage: "brain")
+                    .padding(.horizontal, 6).padding(.vertical, 3)
+                    .background(Capsule().fill(.quaternary.opacity(0.5)))
+                    .help("این گفته در حافظهٔ tuti ذخیره شد (~/Documents/tuti-memory/memory.md)")
+            }
+            if card.fallback {
+                if retrying {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Button { onRetry(card.id) } label: {
+                        Label("تلاش دوباره", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    .help("اجرای دوبارهٔ ویرایش AI روی متن خام")
+                }
+            }
             if let raw = card.raw, !raw.isEmpty, raw != card.text {
                 Button { showRaw.toggle() } label: {
                     Label(showRaw ? "نهایی" : "خام",
