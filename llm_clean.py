@@ -1,5 +1,5 @@
 """Stage 2/3: LLM calls for tuti — text cleanup, the message mode, voice-command intent,
-the long-term memory merge, the memory panel's task-plan ask and its AI chat.
+the long-term memory merge and the memory panel's AI chat.
 
 Two dialects, picked from the base URL:
   OpenAI-compatible chat/completions — TUTI_LLM_BASE_URL e.g. https://api.openai.com/v1
@@ -230,21 +230,6 @@ def memory(current_md: str, text: str) -> tuple[str | None, tuple[int, int]]:
                  extra=f"<m>\n{current_md}\n</m>", note=f"تاریخ امروز: {today}", timeout=60)
 
 
-def plan(memory_md: str, question: str) -> tuple[str | None, tuple[int, int]]:
-    """The memory panel's «چینش با AI»: the whole memory file + an optional question → a
-    short ordered plan for the open tasks (prompts/plan.md). Read-only on the file.
-    TUTI_LLM_PLAN_MODEL overrides the model for this one call — a stronger head than the
-    dictation cleaner is fine here. None = off or failed — the panel shows an error line.
-    """
-    if not configured():
-        return None, (0, 0)
-    today = datetime.now().strftime("%Y-%m-%d (%A)")
-    return _call("plan", "plan.md", question.strip() or "کارهام رو به ترتیبی که باید انجام بگیرم بچین",
-                 context=None, max_tokens=1024, extra=f"<m>\n{memory_md}\n</m>",
-                 note=f"تاریخ امروز: {today}", timeout=60,
-                 model=os.environ.get("TUTI_LLM_PLAN_MODEL") or None)
-
-
 def chat(memory_md: str, turns: list[dict], text: str) -> tuple[str | None, str | None, tuple[int, int]]:
     """The memory panel's chat with the AI (prompts/chat.md): the file + the recent turns +
     a new message → (short reply, the whole rewritten file or None, usage).
@@ -252,7 +237,7 @@ def chat(memory_md: str, turns: list[dict], text: str) -> tuple[str | None, str 
     The model appends the full new file after ===MEMORY=== … ===END=== only when the
     message changed something (a save, a rename, a tick, a delete); otherwise the reply
     stands alone. None reply = off or failed. TUTI_LLM_PLAN_MODEL overrides the model —
-    the same stronger-head reasoning as plan().
+    a stronger head than the dictation cleaner is fine for the chat.
     """
     if not configured():
         return None, None, (0, 0)

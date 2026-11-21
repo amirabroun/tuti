@@ -88,10 +88,6 @@ final class TranscriptViewModel {
     private(set) var memoryExists = true
     private(set) var memoryTasks: [MemoryTask] = []
     private(set) var memoryFacts: [String] = []
-    // the «چینش با AI» ask: one server LLM call, answered by "memory_plan_result"
-    private(set) var planPending = false
-    private(set) var planText: String?
-    private(set) var planFailed = false
     // The «افزودن به حافظه» bar's own recorder — deliberately separate from the main
     // cards/clipboard flow: no card is created, phase stays .ready, the bar itself shows
     // the live partial and the merge's save state.
@@ -327,17 +323,6 @@ final class TranscriptViewModel {
                      "mode": cards[idx].mode ?? "message"])
     }
 
-    /// The «چینش با AI» ask: one LLM call on the server with the whole memory file; the
-    /// reply replaces any previous plan text. The question is optional ("" = the prompt's
-    /// default order: simple first, soonest deadline first).
-    func askPlan(_ question: String) {
-        guard !planPending else { return }
-        planPending = true
-        planFailed = false
-        planText = nil
-        socket.send(["v": 1, "type": "memory_plan", "text": question])
-    }
-
     /// One message to the memory window's AI chat: the recent thread rides along (last 8
     /// turns) so a follow-up like «اسمش رو عوض کن» has its context. One server LLM call;
     /// the model may rewrite the memory file (the answer carries "changed").
@@ -407,8 +392,6 @@ final class TranscriptViewModel {
             phase = .ready
         } else {
             mic.stop()
-            planFailed = planPending  // an in-flight ask can no longer be answered
-            planPending = false
             chatFailed = chatPending
             chatPending = false
             memoryActive = false  // a merge in flight can no longer report back
@@ -496,14 +479,6 @@ final class TranscriptViewModel {
                 reloadMemory()  // the panel and menu bar show the new content right away
             }
             scheduleMemorySaveClear()
-        case "memory_plan_result":
-            // the «چینش با AI» answer for the memory panel
-            planPending = false
-            if let text = message["text"] as? String, !(message["failed"] as? Bool ?? false) {
-                planText = text
-            } else {
-                planFailed = true
-            }
         case "memory_chat_result":
             // the memory chat's reply; changed = the memory file was rewritten on disk
             chatPending = false

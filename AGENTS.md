@@ -6,8 +6,9 @@ Speak → live ASR transcript → one LLM pass after stop → clipboard/history.
 prompt mode 2026-11-13 (REPLACED 2026-11-15 by message mode — light summary +
 smooth + sentence reorder, prompts/message.md; the agent-prompt mode and agent.md are gone; the «پیام» toggle removed
 2026-11-21 — message is now the only mode) and (same day) the main window became a
-3-tab sidebar (کلیپ‌بورد/حافظه/تنظیمات, no separate windows) and auto-stop was removed
-(manual stop only, both recorders)
+3-tab sidebar (کلیپ‌بورد/حافظه/تنظیمات, no separate windows), auto-stop was removed
+(manual stop only, both recorders) and the memory tasks got AI-chosen «##» categories
+plus an «امروز» group (the «چینش با AI» card was removed same day)
 the shared ASR glossary (frequency-ordered keyword list in clean.md + message.md, built from
 llm_calls.jsonl evidence) 2026-11-15; a stronger agent is the known future direction.
 
@@ -20,20 +21,21 @@ llm_calls.jsonl evidence) 2026-11-15; a stronger agent is the known future direc
   `Actions.swift` (voice-command executor: Reminders/search/open URL), `Paragraphs.swift`
   (deterministic final-text paragrapher), `Permissions.swift` (the settings tab: permission
   dots + the LLM config the server reports; asks everything on first launch),
-  `MemoryView.swift` (the «حافظه» tab: read-only render of memory.md + the AI chat +
-  the AI plan ask + the «افزودن به حافظه» recorder bar; the memory.md parser lives here
+  `MemoryView.swift` (the «حافظه» tab: read-only render of memory.md grouped into the
+  AI-chosen «##» categories + an «امروز» group, the AI chat +
+  the «افزودن به حافظه» recorder bar; the memory.md parser lives here
   too). xcodegen project from `project.yml`.
 - `server.py` — Python sidecar (PEP-723, `uv run`): ASR over WebSocket. Protocol v1 = the
   docstring at the top. Runs mehdi-hf/nemotron-asr-streaming-farsi offline from local caches.
 - `llm_clean.py` — LLM client, stdlib only; OpenAI + Anthropic dialects (Anthropic when
-  "anthropic" is in the base URL; thinking disabled). `clean()`/`message()`/`intent()`/`memory()`/`plan()`/`chat()` return
+  "anthropic" is in the base URL; thinking disabled). `clean()`/`message()`/`intent()`/`memory()`/`chat()` return
   `(result, (in_tokens, out_tokens))` (chat returns `(reply, new_file_or_None, usage)`) and
   append every call to `llm_calls.jsonl`
-  (kind: clean/message/intent/memory/plan/chat). Since 2026-11-18: one retry on HTTP 429 (the shared Z.ai
+  (kind: clean/message/intent/memory/chat). Since 2026-11-18: one retry on HTTP 429 (the shared Z.ai
   coding plan's short-lived limit — it clears in ~a minute; sleep = the API's Retry-After,
   capped 8 s, else 4 s), and FAILED calls are logged too: `out_text: null` + `error`
   (HTTP code + response body) + `ms`/`tries`, so rate limits stay debuggable afterwards.
-  Since the 2026-11-20 audit: `_call` takes a per-call timeout — memory()/chat()/plan() use
+  Since the 2026-11-20 audit: `_call` takes a per-call timeout — memory()/chat() use
   60 s (whole-file rewrites outgrow the 15 s default at ~30 out-tokens/s), clean/message/intent
   keep 15 s. The server's usage total is module-level (TOKENS + lock) — the menu bar shows
   true cumulative-since-start tokens, not the last session's.
@@ -44,23 +46,23 @@ llm_calls.jsonl evidence) 2026-11-15; a stronger agent is the known future direc
   (frequency-ordered, ASR-actual spellings like پونیتیل/کویست/پیارو; «اسکیل پونیتیل ← ponytail
   skill» as a compound entry — the single word alone flaked even when listed first). `prompts/intent.md` —
   the voice-command classifier (stage 3 mini, 2026-11-09). `prompts/memory.md` — the memory
-  merge prompt (2026-11-20): current file in `<m>…</m>` + transcript in `<t>…</t>` → the whole
-  rewritten file back (dedup, tick done `- [x]`, drop nothing else). `prompts/plan.md` — the
-  «چینش با AI» prompt (2026-11-20): memory file in `<m>…</m>` + optional question in `<t>…</t>`
-  → a short numbered order for the open tasks (simple first by default; overdue on top).
-  `prompts/chat.md` — the memory window's AI-chat prompt (2026-11-20): file in `<m>…</m>` +
+  merge prompt (2026-11-20; «##» task categories since 2026-11-21): current file in `<m>…</m>` +
+  transcript in `<t>…</t>` → the whole rewritten file back (dedup, tick done `- [x]`, drop
+  nothing else; the count and names of the «##» categories are the model's call — it builds,
+  moves and merges them as the content dictates). `prompts/chat.md` — the memory tab's
+  AI-chat prompt (2026-11-20): file in `<m>…</m>` +
   recent turns in `<history>` + new message in `<t>…</t>` → a 1–2 sentence Persian reply;
   when (and only when) the file changed, the whole new file follows after `===MEMORY=== …
-  ===END===` (the chat can save/rename/tick/delete like a merge).
+  ===END===` (the chat can save/rename/tick/delete/recategorize like a merge).
 - `.env` — TUTI_LLM_BASE_URL / TUTI_LLM_MODEL / TUTI_LLM_API_KEY (gitignored SECRET: never
   echo the key, never commit it; empty = cleanup off and no intent calls). `TUTI_LLM_PLAN_MODEL`
-  optional — swaps the model for the plan() and chat() calls only.
+  optional — swaps the model for the chat() call only (name kept for config compatibility).
 - `docs/plans/` — one executed plan per stage (the decision history).
 - Data: `~/Library/Application Support/tuti/history.jsonl` (entries carry a UUID since
   2026-11-09; pre-UUID lines match by ts+raw; `fallback`/`mode` fields since 2026-11-18 —
   pre-flag lines are detected as fallbacks by clean == raw), `~/Library/Application Support/tuti/llm_calls.jsonl`
   (per-call before/after + tokens; failures too since 2026-11-18), `~/Library/Application Support/tuti/memory_log.jsonl`
-  (one JSONL event per memory interaction — record/chat/plan: raw + AI answer + outcome +
+  (one JSONL event per memory interaction — record/chat: raw + AI answer + outcome +
   tokens; the usage-analysis record, 2026-11-20), `~/Documents/tuti-memory/memory.md`
   (the auto memory file, 2026-11-20 — HIS file, hand-editable; `.bak` next to it),
   `~/Library/Logs/tuti/server.log`.
@@ -135,7 +137,7 @@ the fallback is a real copy into /Applications after each build.
 - Memory (2026-11-20, REVISED twice same day — MANUAL-ONLY, then SPLIT): the auto intent
   gate (`{"action":"memory"}` in intent.md + the server's gate branch) lived a few hours
   and is REMOVED — he hit its unreliability and wants the trigger in his own hands.
-  Capture = the «حافظه» window's purple «افزودن به حافظه» bar (bottom): its OWN recorder,
+  Capture = the «حافظه» tab's purple «افزودن به حافظه» bar (bottom): its OWN recorder,
   fully separate from the main cards/clipboard flow — a memory recording creates NO card,
   NO history line and never touches the clipboard/paste (the transcript lives in the file
   and in llm_calls.jsonl kind "memory"); the main phase stays .ready and Record/⌥Space are
@@ -146,19 +148,25 @@ the fallback is a real copy into /Applications after each build.
   (plain / `unchanged` / `failed`) shown as a transient state line in the bar («حفظ شد»
   lingers ~4 s). Plain dictation never touches memory. The retry never re-runs memory.
   Old history lines with memory:true still show the card chip on relaunch. Every memory
-  interaction (record/chat/plan) lands as one JSONL event — raw + AI answer + outcome +
+  interaction (record/chat) lands as one JSONL event — raw + AI answer + outcome +
   tokens — in memory_log.jsonl (see Data), the later processing record; the window's
   title row has a button to open it.
-- Memory viewer + chat + plan ask (2026-11-20; a TAB of the main window since 2026-11-21,
+- Memory viewer + chat (2026-11-20; a TAB of the main window since 2026-11-21,
   no separate window): menu bar or the sidebar opens
-  the «حافظه» tab — memory.md rendered read-only (open tasks, done = struck + green
-  tick, past-date open task = orange date), refresh button, «باز کردن فایل» (the
+  the «حافظه» tab — memory.md rendered read-only, tasks grouped under the AI-chosen
+  «##» categories in file order with an «امروز» group on top (open tasks due today or
+  overdue, across categories; a file with no headings yet renders as the old flat list
+  until the first merge sorts it), done = struck + green
+  tick, past-date open task = orange date, refresh button, «باز کردن فایل» (the
   hand-edit path). «گفت‌وگو با AI» card: a small thread over the memory file — text input →
   `memory_chat` (recent turns ride along) → one `chat()` call → `memory_chat_result`; the
-  model answers in a sentence or two and may rewrite the file (save/rename/tick/delete,
-  same lock + .bak path as a merge; `changed:true` → the list reloads live). «چینش با AI»
-  stays as its own card: optional question + one `plan()` call → `memory_plan_result`
-  (failure = an error line, the file untouched). The app watches the memory folder, so
+  model answers in a sentence or two and may rewrite the file
+  (save/rename/tick/delete/recategorize,
+  same lock + .bak path as a merge; `changed:true` → the list reloads live). The «چینش با
+  AI» card REMOVED 2026-11-21 («به درد نمی‌خوره») — plan(), prompts/plan.md, the
+  `memory_plan`/`memory_plan_result` protocol messages and the "plan" kind in the logs are
+  all gone; ordering questions go through the chat instead. The app watches the memory
+  folder, so
   merges land in the panel/menu bar live. Menu bar adds the next 3 open tasks (soonest
   first, click = the tab) + «حافظه…» + the file item; the icon shows brain + word
   count while the memory recorder runs. The bare-Space monitor requires the MAIN window to

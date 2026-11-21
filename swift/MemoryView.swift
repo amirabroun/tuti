@@ -5,6 +5,7 @@ struct MemoryTask: Identifiable {
     let id: Int  // the line's order in the file — the merge prompt keeps it stable
     let done: Bool
     let date: String?  // the ISO «YYYY-MM-DD» prefix when the line carries one
+    let category: String?  // the «##» heading it sits under; nil = directly under «# کارها» (not yet categorized)
     let text: String
 
     /// An open task whose day has passed — shown in orange so it nags without a sound.
@@ -21,8 +22,9 @@ struct MemoryTask: Identifiable {
     }()
 }
 
-/// The parsed memory file: the two sections tuti keeps («# کارها» checkbox lines,
-/// «# حقایق» bullets). Anything else in the file is ignored, so it stays hand-editable.
+/// The parsed memory file: the two sections tuti keeps («# کارها» checkbox lines grouped
+/// under the AI-chosen «##» category headings, «# حقایق» bullets). Anything else in the
+/// file is ignored, so it stays hand-editable.
 struct MemoryFile {
     var tasks: [MemoryTask] = []
     var facts: [String] = []
@@ -37,13 +39,17 @@ struct MemoryFile {
     static func parse(_ s: String) -> MemoryFile {
         var f = MemoryFile()
         var section = ""
+        var category: String? = nil  // the current «##» heading; a «# کارها» line resets it
         for line in s.split(separator: "\n") {
             let l = line.trimmingCharacters(in: .whitespaces)
             if l.hasPrefix("# ") {
                 section = String(l.dropFirst(2))
+                category = nil
+            } else if l.hasPrefix("## "), section == "کارها" {
+                category = String(l.dropFirst(3)).trimmingCharacters(in: .whitespaces)
             } else if l.hasPrefix("- ") {
                 let body = String(l.dropFirst(2))
-                if section == "کارها", let task = task(from: body, id: f.tasks.count) {
+                if section == "کارها", let task = task(from: body, category: category, id: f.tasks.count) {
                     f.tasks.append(task)
                 } else if section == "حقایق" {
                     f.facts.append(body)
@@ -54,7 +60,7 @@ struct MemoryFile {
     }
 
     /// `- [x] 2026-11-21 — توضیح` → (done, date, text); a non-checkbox line is not a task.
-    private static func task(from body: String, id: Int) -> MemoryTask? {
+    private static func task(from body: String, category: String?, id: Int) -> MemoryTask? {
         var rest = body
         let done: Bool
         if rest.hasPrefix("[x] ") {
@@ -76,16 +82,16 @@ struct MemoryFile {
                 }
             }
         }
-        return MemoryTask(id: id, done: done, date: date, text: rest)
+        return MemoryTask(id: id, done: done, date: date, category: category, text: rest)
     }
 }
 
-/// The «حافظه» window: the memory file rendered read-only (the file is the source of truth —
-/// hand-edit it via «باز کردن فایل»), with the AI plan ask on top. Same card language as the
-/// Settings panel (quaternary fill, 10-pt radius) so the two windows read as one app.
+/// The «حافظه» tab: the memory file rendered read-only (the file is the source of truth —
+/// hand-edit it via «باز کردن فایل»), grouped into the AI-chosen «##» categories with an
+/// «امروز» group on top. Same card language as the Settings tab (quaternary fill, 10-pt
+/// radius) so the tabs read as one app.
 struct MemoryPanelView: View {
     let model: TranscriptViewModel
-    @State private var question = ""
     @State private var chatDraft = ""
 
     var body: some View {
@@ -120,16 +126,30 @@ struct MemoryPanelView: View {
 
                     chatCard
 
-                    planCard
-
                     if !model.memoryExists {
                         Text("هنوز چیزی ذخیره نشده — پایین، «ضبط» رو بزن و بگو.")
                             .foregroundStyle(.secondary)
                     }
                     if !model.memoryTasks.isEmpty {
-                        section(tasksTitle) {
-                            ForEach(model.memoryTasks) { task in
-                                taskRow(task)
+                        // «امروز» first: open tasks due today or overdue, across all categories.
+                        if !dueTasks.isEmpty {
+                            section("امروز") {
+                                ForEach(dueTasks) { taskRow($0) }
+                            }
+                        }
+                        // then the «##» categories in file order; a file with no headings yet
+                        // (until the first merge sorts it) renders as the old flat list
+                        if let groups = categoryGroups, !(groups.count == 1 && groups[0].name == nil) {
+                            ForEach(Array(groups.enumerated()), id: \.offset) { _, group in
+                                section(group.name ?? "دیگر") {
+                                    ForEach(group.tasks) { taskRow($0) }
+                                }
+                            }
+                        } else {
+                            section(tasksTitle) {
+                                ForEach(model.memoryTasks) { task in
+                                    taskRow(task)
+                                }
                             }
                         }
                     }
@@ -292,34 +312,22 @@ struct MemoryPanelView: View {
         }
     }
 
-    /// The «چینش با AI» card: optional question + one server LLM call, answer listed below.
-    private var planCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Image(systemName: "sparkles")
-                Text("چینش با AI").font(.body.weight(.medium))
-            }
-            HStack(spacing: 8) {
-                TextField("سؤال یا معیار چینش (اختیاری)", text: $question)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { model.askPlan(question) }
-                Button("چینش") { model.askPlan(question) }
-                    .disabled(model.planPending)
-            }
-            if model.planPending {
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text("در حال فکر کردن…").font(.caption).foregroundStyle(.secondary)
-                }
-            } else if model.planFailed {
-                Text("چینش ناموفق — دوباره امتحان کن.").font(.caption).foregroundStyle(.red)
-            } else if let plan = model.planText {
-                Text(plan).font(.callout).textSelection(.enabled)
-            }
+    /// Open tasks due today or already overdue — the «امروز» group on top of the list.
+    private var dueTasks: [MemoryTask] {
+        model.memoryTasks.filter { !$0.done && ($0.date == MemoryTask.today || $0.overdue) }
+    }
+
+    /// Tasks folded into their «##» categories, file order preserved; a task directly under
+    /// «# کارها» lands in the nil-name group. nil = the file has no headings at all.
+    private var categoryGroups: [(name: String?, tasks: [MemoryTask])]? {
+        guard !model.memoryTasks.isEmpty else { return nil }
+        var order: [String?] = []
+        var buckets: [String?: [MemoryTask]] = [:]
+        for task in model.memoryTasks {
+            if buckets[task.category] == nil { order.append(task.category) }
+            buckets[task.category, default: []].append(task)
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 10).fill(.quaternary.opacity(0.5)))
+        return order.map { ($0, buckets[$0] ?? []) }
     }
 
     /// «کارها — ۲ باز از ۳» (or just the count when everything is open) — a glance at the

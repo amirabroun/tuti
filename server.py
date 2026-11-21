@@ -22,11 +22,6 @@ Protocol v1 -- JSON text frames (real unicode), binary audio frames:
                                                                a manual re-clean of an old
                                                                recording (the mode it was
                                                                recorded in; absent = clean)
-                  {"v":1,"type":"memory_plan","text":"<question>?"}
-                                                               the memory panel's «چینش با AI»:
-                                                               the whole memory file + this
-                                                               optional question → one plan
-                                                               LLM call; no file is touched
   server -> app   {"v":1,"type":"asr_partial","text":"..."}   the whole raw transcript so far; the
                                                                LLM is never called mid-recording
                   {"v":1,"type":"clean_state","on":true}      the final clean started ("Editing...")
@@ -66,11 +61,6 @@ Protocol v1 -- JSON text frames (real unicode), binary audio frames:
                                                                "unchanged":true = the model judged
                                                                the file already covers it,
                                                                "failed":true = the merge failed
-                  {"v":1,"type":"memory_plan_result","text":"..."}
-                                                               the «چینش با AI» answer (the
-                                                               ordered task plan); optional
-                                                               "failed":true = the call failed
-                                                               and text is empty
                   {"v":1,"type":"memory_chat","text":"<msg>",
                    "turns":[{"who":"me"|"ai","text":"..."}]}
                                                                the «حافظه» window's chat: recent
@@ -84,7 +74,7 @@ Protocol v1 -- JSON text frames (real unicode), binary audio frames:
                                                                "failed":true = the call failed
                   {"v":1,"type":"error","message":"..."}
 The socket only opens once the model is loaded, so "connected" means "ready".
-Every memory interaction (record / chat / plan) also appends ONE JSONL event — the raw
+Every memory interaction (record / chat) also appends ONE JSONL event — the raw
 speech or message AND the AI's answer side by side, plus outcome and tokens — to
 ~/Library/Application Support/tuti/memory_log.jsonl (the usage-analysis record).
 Connections that send an Origin header (web pages in a browser) are refused with HTTP 403.
@@ -123,7 +113,7 @@ MEMORY_LOCK = threading.Lock()  # one merge at a time: back-to-back memory-worth
 MEMORY_LOG = os.path.expanduser("~/Library/Application Support/tuti/memory_log.jsonl")
 MLOG_LOCK = threading.Lock()
 # cumulative LLM tokens since the server start (the menu-bar total); several worker
-# threads (clean, memory merge, chat, plan) report usage, so the += needs the lock
+# threads (clean, memory merge, chat) report usage, so the += needs the lock
 TOKENS = {"in": 0, "out": 0}
 TOKENS_LOCK = threading.Lock()
 
@@ -425,31 +415,6 @@ def _re_clean(emit, m: dict) -> None:
     _add_tokens(emit, usage)
 
 
-def _memory_plan(emit, m: dict) -> None:
-    """The app's «چینش با AI»: the whole memory file + an optional question → one plan LLM
-    call (prompts/plan.md), in a thread — the asyncio loop must not wait on the API.
-    Read-only on the file: the merge writes via os.replace (atomic), so racing one is
-    harmless — the reader sees the file whole, old or new."""
-    current = ""
-    try:
-        with open(MEMORY_PATH) as f:
-            current = f.read()
-    except OSError:
-        pass  # no memory file yet: the caller gets the «empty» answer below
-    if not current.strip():
-        _mlog("plan", question=m.get("text", ""), answer=None, failed=False, tokens=[0, 0])
-        emit("memory_plan_result", "هنوز چیزی در حافظه ذخیره نشده.", None)
-        return
-    answer, usage = llm_clean.plan(current, m.get("text", ""))
-    _add_tokens(emit, usage)
-    _mlog("plan", question=m.get("text", ""), answer=answer, failed=not answer,
-          tokens=list(usage))
-    if answer:
-        emit("memory_plan_result", answer, None)
-    else:
-        emit("memory_plan_result", "", {"failed": True})
-
-
 def _memory_chat(emit, m: dict) -> None:
     """The «حافظه» window's chat (prompts/chat.md): the file + the recent turns + a new
     message → a short answer; a rewritten file lands on disk like a merge. In a thread;
@@ -502,9 +467,6 @@ async def handler(ws) -> None:
             m = json.loads(msg)
             if m.get("type") == "retry":
                 Thread(target=_re_clean, args=(emit, m), daemon=True).start()
-                continue
-            if m.get("type") == "memory_plan":
-                Thread(target=_memory_plan, args=(emit, m), daemon=True).start()
                 continue
             if m.get("type") == "memory_chat":
                 Thread(target=_memory_chat, args=(emit, m), daemon=True).start()
