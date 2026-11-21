@@ -3,21 +3,24 @@
 Personal Persian dictation app for Amir (single user, macOS app only — no web UI, no auth).
 Speak → live ASR transcript → one LLM pass after stop → clipboard/history. Stage 3 mini
 (voice commands) shipped 2026-11-09; stage 4 (final-only clean + live menu bar) 2026-11-10;
-prompt mode 2026-11-13 (REPLACED 2026-11-15 by message mode — a «پیام» toggle: light summary +
-smooth + sentence reorder, prompts/message.md; the agent-prompt mode and agent.md are gone) and
+prompt mode 2026-11-13 (REPLACED 2026-11-15 by message mode — light summary +
+smooth + sentence reorder, prompts/message.md; the agent-prompt mode and agent.md are gone; the «پیام» toggle removed
+2026-11-21 — message is now the only mode) and (same day) the main window became a
+3-tab sidebar (کلیپ‌بورد/حافظه/تنظیمات, no separate windows) and auto-stop was removed
+(manual stop only, both recorders)
 the shared ASR glossary (frequency-ordered keyword list in clean.md + message.md, built from
 llm_calls.jsonl evidence) 2026-11-15; a stronger agent is the known future direction.
 
 ## Map
 
-- `swift/` — SwiftUI app: `App.swift` (window, cards, menu-bar dropdown), `TranscriptViewModel.swift`
+- `swift/` — SwiftUI app: `App.swift` (main window + sidebar tabs, cards, menu-bar dropdown), `TranscriptViewModel.swift`
   (state, socket, mic, timers, card delete/search), `SidecarManager.swift` (launches the
   server, owns the log), `HotkeyCenter.swift` (global ⌥Space + the paste-back ⌘V),
   `CopyHud.swift` (the copied-feedback pop sound + floating HUD capsule),
   `Actions.swift` (voice-command executor: Reminders/search/open URL), `Paragraphs.swift`
-  (deterministic final-text paragrapher), `Permissions.swift` (Settings panel: permission
+  (deterministic final-text paragrapher), `Permissions.swift` (the settings tab: permission
   dots + the LLM config the server reports; asks everything on first launch),
-  `MemoryView.swift` (the «حافظه» window: read-only render of memory.md + the AI chat +
+  `MemoryView.swift` (the «حافظه» tab: read-only render of memory.md + the AI chat +
   the AI plan ask + the «افزودن به حافظه» recorder bar; the memory.md parser lives here
   too). xcodegen project from `project.yml`.
 - `server.py` — Python sidecar (PEP-723, `uv run`): ASR over WebSocket. Protocol v1 = the
@@ -82,18 +85,28 @@ the fallback is a real copy into /Applications after each build.
   (active card + menu bar); after stop the WHOLE transcript gets ONE LLM pass and the result
   replaces the card text. No style picker, no Re-clean, no History panel (removed
   2026-11-09 — cards ARE the history).
-- Message mode (2026-11-15, replaced prompt mode 2026-11-13): sticky «پیام» checkbox (status
-  row) + menu-bar toggle. ON at Record time → the post-stop pass is `llm_clean.message()`
+- Message mode (2026-11-15, replaced prompt mode 2026-11-13): THE ONLY MODE since
+  2026-11-21 — the sticky «پیام» checkbox (status row) + menu-bar toggle were removed
+  because it was effectively always on. Every recording's post-stop pass is
+  `llm_clean.message()`
   (prompts/message.md: clean + light summary + smooth + reorder; keeps all facts, names and
-  tech details, never answers the speaker) instead of the clean; no verbatim clean exists in
-  that mode (card = message text, «خام» flip = raw ASR). Mode is sent on the start frame
-  (`"mode":"message"`, absent = clean) and fixed per recording; ⌥Space follows the same
-  toggle. Benchmark notes: glm-4.5-air glossary recall is ~95% per call (one دیف occasionally
+  tech details, never answers the speaker); no verbatim clean exists for new recordings
+  (card = message text, «خام» flip = raw ASR). The start frame always carries
+  `"mode":"message"` (absent = clean, kept for the protocol) and the mode is fixed per
+  recording; retryClean defaults pre-2026-11-18 cards to message. prompts/clean.md +
+  `llm_clean.clean()` stay for nothing new — old history only. Benchmark notes:
+  glm-4.5-air glossary recall is ~95% per call (one دیف occasionally
   stays Persian); proper-noun protection can fight the glossary, hence the explicit
   «واژه‌نامه مقدم است» line.
-- Auto-stop checkbox (default on): ~4 s of silence ends the recording → the one pass → history.
+- Auto-stop REMOVED 2026-11-21 (he never used it): the whole silence-timer mechanism is
+  gone — recordings end ONLY by Stop/Space/⌥Space (or the server's own idle timeout) in
+  BOTH recorders (the timer used to serve the memory recorder too). No replacement.
 - Finished text is paragraphed deterministically (a break every 3 sentence enders, no LLM).
-- Main window = card list, one card per recording, click a card to copy. Launch loads the last
+- Main window (2026-11-21) = NavigationSplitView with a 3-item sidebar — کلیپ‌بورد (the
+  card list) / حافظه / تنظیمات — switching IN PLACE; the old separate «حافظه»/Settings
+  windows are gone (no new window opens). Menu bar items select the tab and bring the main
+  window forward. The dictation tab keeps status, search, cards, errors, Record.
+- Card list = one card per recording, click a card to copy. Launch loads the last
   50 history entries as cards. Finished cards: «خام» chip (bordered, waveform/wand icon) =
   flip to the raw ASR text, trash = delete card + history entry (no confirm, red on hover).
   Inline card edit REMOVED 2026-11-13 (never used). Search field filters cards by clean or
@@ -105,12 +118,13 @@ the fallback is a real copy into /Applications after each build.
 - Menu bar (app stays alive after the window closes; Quit lives there): icon alone shows the
   state — mic.fill + live word count while recording (brain + count while the memory
   window's recorder runs), wand.and.stars while the AI edits, waveform idle; dropdown adds
-  the last ~60 chars heard while recording, status, record, the «پیام» toggle, last 5 cards
+  the last ~60 chars heard while recording, status, record, last 5 cards
   (click = copy), cumulative token usage, Launch at Login.
 - Global ⌥Space: record from any app; when the recording finishes it activates that app and
   pastes the result there. Recordings started in-window never paste.
-- Permissions asked together on the first launch (2026-11-10): the Settings panel opens once
-  (mic prompt + Reminders automation probe fire right there), reopenable from the menu bar
+- Permissions asked together on the first launch (2026-11-10): the settings TAB opens once
+  on first launch (2026-11-21: selects the tab instead of opening a window; mic prompt +
+  Reminders automation probe fire right there), reopenable from the menu bar
   (Settings…). It also shows the LLM config actually loaded (model + URL from the server's
   one `config` message; the key never crosses the socket). Accessibility is only linked to
   its Settings pane — macOS grants it by hand, never via API. The menu-bar dropdown shows
@@ -135,8 +149,9 @@ the fallback is a real copy into /Applications after each build.
   interaction (record/chat/plan) lands as one JSONL event — raw + AI answer + outcome +
   tokens — in memory_log.jsonl (see Data), the later processing record; the window's
   title row has a button to open it.
-- Memory viewer + chat + plan ask (2026-11-20): the toolbar brain icon or menu bar opens
-  the «حافظه» window — memory.md rendered read-only (open tasks, done = struck + green
+- Memory viewer + chat + plan ask (2026-11-20; a TAB of the main window since 2026-11-21,
+  no separate window): menu bar or the sidebar opens
+  the «حافظه» tab — memory.md rendered read-only (open tasks, done = struck + green
   tick, past-date open task = orange date), refresh button, «باز کردن فایل» (the
   hand-edit path). «گفت‌وگو با AI» card: a small thread over the memory file — text input →
   `memory_chat` (recent turns ride along) → one `chat()` call → `memory_chat_result`; the
@@ -145,9 +160,10 @@ the fallback is a real copy into /Applications after each build.
   stays as its own card: optional question + one `plan()` call → `memory_plan_result`
   (failure = an error line, the file untouched). The app watches the memory folder, so
   merges land in the panel/menu bar live. Menu bar adds the next 3 open tasks (soonest
-  first, click = open the window) + «حافظه…» + the file item; the icon shows brain + word
+  first, click = the tab) + «حافظه…» + the file item; the icon shows brain + word
   count while the memory recorder runs. The bare-Space monitor requires the MAIN window to
-  be key (a focused memory/settings window used to start recordings on Space).
+  be key AND the clipboard tab to be selected (2026-11-21: tabs live in that same window,
+  so tab checking replaced the old separate-window guard).
 - LLM/API failure (after the one 429 retry) → the raw text becomes the result (clean_all then carries `"fallback":true`);
   the recording is unaffected. The clipboard is written exactly once per recording (at finish),
   never mid-recording.

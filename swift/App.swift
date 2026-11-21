@@ -50,15 +50,6 @@ struct TutiApp: App {
                 }
             }
         }
-        // opens only via openWindow (toolbar, menu bar) — never at app launch
-        Window("حافظه", id: "memory") {
-            MemoryPanelView(model: model)
-        }
-        // opens only via openWindow (first launch, menu bar) — never at app launch
-        Window("Settings", id: "settings") {
-            PermissionsView(model: model)
-                .environment(permissions)
-        }
     }
 }
 
@@ -83,22 +74,23 @@ private struct MenuBarContent: View {
         Divider()
         Button(model.phase == .recording ? "Stop" : "Record") { model.uiToggleRecord() }
             .disabled(model.memoryActive || (model.phase != .ready && model.phase != .recording))
-        Toggle("پیام", isOn: Bindable(model).messageMode)  // ⌥Space users switch mode without the window
         Divider()
         ForEach(model.cards.filter { $0.isFinal }.suffix(5).reversed()) { card in
             Button(menuTitle(card.text)) { model.copyText(card.text) }
         }
         if model.memoryExists {
             Divider()
-            // the next open tasks (soonest first); a click opens the full «حافظه» window
+            // the next open tasks (soonest first); a click opens the main window's «حافظه» tab
             ForEach(model.openMemoryTasks.prefix(3)) { task in
                 Button(menuTaskTitle(task)) {
-                    openWindow(id: "memory")
+                    model.selectedTab = .memory
+                    openWindow(id: "main")
                     NSApp.activate(ignoringOtherApps: true)
                 }
             }
             Button("حافظه…") {
-                openWindow(id: "memory")
+                model.selectedTab = .memory
+                openWindow(id: "main")
                 NSApp.activate(ignoringOtherApps: true)
             }
             Button("باز کردن فایل حافظه") {
@@ -121,7 +113,8 @@ private struct MenuBarContent: View {
             NSApp.activate(ignoringOtherApps: true)
         }
         Button("Settings…") {
-            openWindow(id: "settings")
+            model.selectedTab = .settings
+            openWindow(id: "main")
             NSApp.activate(ignoringOtherApps: true)
         }
         Divider()
@@ -149,9 +142,37 @@ private struct MenuBarContent: View {
 struct ContentView: View {
     let model: TranscriptViewModel
     @Environment(PermissionsModel.self) private var permissions
-    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
+        NavigationSplitView {
+            // List selection is optional-typed; nil (= deselected) is ignored so a tab
+            // never goes blank
+            List(selection: Binding<MainTab?>(
+                get: { model.selectedTab },
+                set: { if let tab = $0 { model.selectedTab = tab } }
+            )) {
+                Label("کلیپ‌بورد", systemImage: "doc.on.doc").tag(MainTab.clipboard)
+                Label("حافظه", systemImage: "brain").tag(MainTab.memory)
+                Label("تنظیمات", systemImage: "gearshape").tag(MainTab.settings)
+            }
+            .navigationSplitViewColumnWidth(150)
+        } detail: {
+            switch model.selectedTab {
+            case .clipboard: clipboardTab
+            case .memory: MemoryPanelView(model: model)
+            case .settings: PermissionsView(model: model).environment(permissions)
+            }
+        }
+        .onAppear {
+            model.captureMainWindow()
+            // first run only: ask every permission at once — the settings tab is the guide
+            if permissions.firstLaunchCheck() { model.selectedTab = .settings }
+        }
+    }
+
+    /// The dictation flow: status, search, cards, errors, Record. The only tab where a
+    /// bare Space toggles Record (the Space monitor checks selectedTab).
+    private var clipboardTab: some View {
         VStack(spacing: 12) {
             HStack {
                 Circle().fill(statusColor).frame(width: 10, height: 10)
@@ -160,8 +181,6 @@ struct ContentView: View {
                 if model.phase == .recording {
                     Text(String(format: "%.0f dB", model.levelDb)).monospacedDigit()
                 }
-                Toggle("Auto-stop", isOn: Bindable(model).autoStop).toggleStyle(.checkbox)
-                Toggle("پیام", isOn: Bindable(model).messageMode).toggleStyle(.checkbox)
             }
             .font(.callout)
             .foregroundStyle(.secondary)
@@ -178,22 +197,6 @@ struct ContentView: View {
                     }
                     .buttonStyle(.borderless)
                 }
-                Button {
-                    openWindow(id: "memory")
-                    NSApp.activate(ignoringOtherApps: true)
-                } label: {
-                    Image(systemName: "brain").foregroundStyle(.secondary)
-                }
-                .buttonStyle(.borderless)
-                .help("حافظه — کارها و حقایق ذخیره‌شده")
-                Button {
-                    openWindow(id: "settings")
-                    NSApp.activate(ignoringOtherApps: true)
-                } label: {
-                    Image(systemName: "gearshape").foregroundStyle(.secondary)
-                }
-                .buttonStyle(.borderless)
-                .help("تنظیمات")
             }
 
             ScrollViewReader { proxy in
@@ -250,14 +253,6 @@ struct ContentView: View {
             .disabled(model.memoryActive || (model.phase != .ready && model.phase != .recording))
         }
         .padding()
-        .onAppear {
-            model.captureMainWindow()
-            // first run only: ask every permission at once, panel on top as the guide
-            if permissions.firstLaunchCheck() {
-                openWindow(id: "settings")
-                NSApp.activate(ignoringOtherApps: true)
-            }
-        }
     }
 
     private var statusColor: Color {

@@ -83,8 +83,6 @@ struct PermissionsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
-                Text("تنظیمات tuti").font(.title3.bold()).padding(.bottom, 2)
-
                 sectionLabel("دسترسی‌ها")
                 permCard(icon: "mic.fill", name: "میکروفون", why: "ضبط گفتار", ok: perms.micGranted) {
                     switch perms.micStatus {
