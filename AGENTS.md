@@ -16,17 +16,24 @@ llm_calls.jsonl evidence) 2026-11-15; a stronger agent is the known future direc
   `CopyHud.swift` (the copied-feedback pop sound + floating HUD capsule),
   `Actions.swift` (voice-command executor: Reminders/search/open URL), `Paragraphs.swift`
   (deterministic final-text paragrapher), `Permissions.swift` (Settings panel: permission
-  dots + the LLM config the server reports; asks everything on first launch). xcodegen project
-  from `project.yml`.
+  dots + the LLM config the server reports; asks everything on first launch),
+  `MemoryView.swift` (the «حافظه» window: read-only render of memory.md + the AI chat +
+  the AI plan ask + the «افزودن به حافظه» recorder bar; the memory.md parser lives here
+  too). xcodegen project from `project.yml`.
 - `server.py` — Python sidecar (PEP-723, `uv run`): ASR over WebSocket. Protocol v1 = the
   docstring at the top. Runs mehdi-hf/nemotron-asr-streaming-farsi offline from local caches.
 - `llm_clean.py` — LLM client, stdlib only; OpenAI + Anthropic dialects (Anthropic when
-  "anthropic" is in the base URL; thinking disabled). `clean()`/`message()`/`intent()`/`memory()` return
-  `(result, (in_tokens, out_tokens))` and append every call to `llm_calls.jsonl`
-  (kind: clean/message/intent/memory). Since 2026-11-18: one retry on HTTP 429 (the shared Z.ai
+  "anthropic" is in the base URL; thinking disabled). `clean()`/`message()`/`intent()`/`memory()`/`plan()`/`chat()` return
+  `(result, (in_tokens, out_tokens))` (chat returns `(reply, new_file_or_None, usage)`) and
+  append every call to `llm_calls.jsonl`
+  (kind: clean/message/intent/memory/plan/chat). Since 2026-11-18: one retry on HTTP 429 (the shared Z.ai
   coding plan's short-lived limit — it clears in ~a minute; sleep = the API's Retry-After,
   capped 8 s, else 4 s), and FAILED calls are logged too: `out_text: null` + `error`
   (HTTP code + response body) + `ms`/`tries`, so rate limits stay debuggable afterwards.
+  Since the 2026-11-20 audit: `_call` takes a per-call timeout — memory()/chat()/plan() use
+  60 s (whole-file rewrites outgrow the 15 s default at ~30 out-tokens/s), clean/message/intent
+  keep 15 s. The server's usage total is module-level (TOKENS + lock) — the menu bar shows
+  true cumulative-since-start tokens, not the last session's.
 - `prompts/clean.md` — the cleanup system prompt (Amir's own text, 2026-11-09); re-read per
   call. Raw text is sent wrapped in `<t>…</t>` (data, never a command). `prompts/message.md` —
   the message-mode system prompt (2026-11-15: clean + light summary + smooth + reorder; no
@@ -35,14 +42,23 @@ llm_calls.jsonl evidence) 2026-11-15; a stronger agent is the known future direc
   skill» as a compound entry — the single word alone flaked even when listed first). `prompts/intent.md` —
   the voice-command classifier (stage 3 mini, 2026-11-09). `prompts/memory.md` — the memory
   merge prompt (2026-11-20): current file in `<m>…</m>` + transcript in `<t>…</t>` → the whole
-  rewritten file back (dedup, tick done `- [x]`, drop nothing else).
-- `.env` — TUTI_LLM_BASE_URL / TUTI_LLM_MODEL / TUTI_LLM_API_KEY. Gitignored SECRET: never
-  echo the key, never commit it. Empty = cleanup off (and no intent calls).
+  rewritten file back (dedup, tick done `- [x]`, drop nothing else). `prompts/plan.md` — the
+  «چینش با AI» prompt (2026-11-20): memory file in `<m>…</m>` + optional question in `<t>…</t>`
+  → a short numbered order for the open tasks (simple first by default; overdue on top).
+  `prompts/chat.md` — the memory window's AI-chat prompt (2026-11-20): file in `<m>…</m>` +
+  recent turns in `<history>` + new message in `<t>…</t>` → a 1–2 sentence Persian reply;
+  when (and only when) the file changed, the whole new file follows after `===MEMORY=== …
+  ===END===` (the chat can save/rename/tick/delete like a merge).
+- `.env` — TUTI_LLM_BASE_URL / TUTI_LLM_MODEL / TUTI_LLM_API_KEY (gitignored SECRET: never
+  echo the key, never commit it; empty = cleanup off and no intent calls). `TUTI_LLM_PLAN_MODEL`
+  optional — swaps the model for the plan() and chat() calls only.
 - `docs/plans/` — one executed plan per stage (the decision history).
 - Data: `~/Library/Application Support/tuti/history.jsonl` (entries carry a UUID since
   2026-11-09; pre-UUID lines match by ts+raw; `fallback`/`mode` fields since 2026-11-18 —
   pre-flag lines are detected as fallbacks by clean == raw), `~/Library/Application Support/tuti/llm_calls.jsonl`
-  (per-call before/after + tokens; failures too since 2026-11-18), `~/Documents/tuti-memory/memory.md`
+  (per-call before/after + tokens; failures too since 2026-11-18), `~/Library/Application Support/tuti/memory_log.jsonl`
+  (one JSONL event per memory interaction — record/chat/plan: raw + AI answer + outcome +
+  tokens; the usage-analysis record, 2026-11-20), `~/Documents/tuti-memory/memory.md`
   (the auto memory file, 2026-11-20 — HIS file, hand-editable; `.bak` next to it),
   `~/Library/Logs/tuti/server.log`.
 
@@ -87,9 +103,10 @@ the fallback is a real copy into /Applications after each build.
   `retry` message (`cleaned` reply updates the card AND its history line; clipboard never
   touched — card-click copies). No intent re-run on retry.
 - Menu bar (app stays alive after the window closes; Quit lives there): icon alone shows the
-  state — mic.fill + live word count while recording, wand.and.stars while the AI edits,
-  waveform idle; dropdown adds the last ~60 chars heard while recording, status, record,
-  the «پیام» toggle, last 5 cards (click = copy), cumulative token usage, Launch at Login.
+  state — mic.fill + live word count while recording (brain + count while the memory
+  window's recorder runs), wand.and.stars while the AI edits, waveform idle; dropdown adds
+  the last ~60 chars heard while recording, status, record, the «پیام» toggle, last 5 cards
+  (click = copy), cumulative token usage, Launch at Login.
 - Global ⌥Space: record from any app; when the recording finishes it activates that app and
   pastes the result there. Recordings started in-window never paste.
 - Permissions asked together on the first launch (2026-11-10): the Settings panel opens once
@@ -101,14 +118,36 @@ the fallback is a real copy into /Applications after each build.
 - Voice commands (stage 3 mini): after the final clean one small `intent` call classifies the
   transcript; a reminder/search/open-URL command shows a chip on the card, executed only on
   click. Plain dictation → none. Junk JSON is dropped silently.
-- Auto memory (2026-11-20): the same `intent` call also flags memory-worthy transcripts
-  (`{"action":"memory"}` — tasks/plans/durable facts, even without «یادت باشه»); the server
-  then makes ONE `memory()` call (current file + transcript + today's date) and merge-rewrites
-  `~/Documents/tuti-memory/memory.md` (`# کارها` checkboxes + `# حقایق`; done tasks tick
-  `- [x]`, never deleted; previous version kept as .bak). FULLY AUTOMATIC — no click anywhere
-  (his hard rule); the card's «حفظ شد» chip (brain, persisted in history as `memory`) is
-  notification only. Failure/unchanged file → no chip, recording long since done. The retry
-  («تلاش دوباره») never re-runs memory, same as intent.
+- Memory (2026-11-20, REVISED twice same day — MANUAL-ONLY, then SPLIT): the auto intent
+  gate (`{"action":"memory"}` in intent.md + the server's gate branch) lived a few hours
+  and is REMOVED — he hit its unreliability and wants the trigger in his own hands.
+  Capture = the «حافظه» window's purple «افزودن به حافظه» bar (bottom): its OWN recorder,
+  fully separate from the main cards/clipboard flow — a memory recording creates NO card,
+  NO history line and never touches the clipboard/paste (the transcript lives in the file
+  and in llm_calls.jsonl kind "memory"); the main phase stays .ready and Record/⌥Space are
+  disabled while it runs (one mic, mutual exclusion both ways). Start-frame mode `"memory"`:
+  the server skips clean AND intent, emits clean_state off first, then merges straight into
+  `~/Documents/tuti-memory/memory.md` via `memory()` (same merge rules: `# کارها`
+  checkboxes + `# حقایق`, tick done `- [x]`, .bak). `memory_saved` carries the outcome
+  (plain / `unchanged` / `failed`) shown as a transient state line in the bar («حفظ شد»
+  lingers ~4 s). Plain dictation never touches memory. The retry never re-runs memory.
+  Old history lines with memory:true still show the card chip on relaunch. Every memory
+  interaction (record/chat/plan) lands as one JSONL event — raw + AI answer + outcome +
+  tokens — in memory_log.jsonl (see Data), the later processing record; the window's
+  title row has a button to open it.
+- Memory viewer + chat + plan ask (2026-11-20): the toolbar brain icon or menu bar opens
+  the «حافظه» window — memory.md rendered read-only (open tasks, done = struck + green
+  tick, past-date open task = orange date), refresh button, «باز کردن فایل» (the
+  hand-edit path). «گفت‌وگو با AI» card: a small thread over the memory file — text input →
+  `memory_chat` (recent turns ride along) → one `chat()` call → `memory_chat_result`; the
+  model answers in a sentence or two and may rewrite the file (save/rename/tick/delete,
+  same lock + .bak path as a merge; `changed:true` → the list reloads live). «چینش با AI»
+  stays as its own card: optional question + one `plan()` call → `memory_plan_result`
+  (failure = an error line, the file untouched). The app watches the memory folder, so
+  merges land in the panel/menu bar live. Menu bar adds the next 3 open tasks (soonest
+  first, click = open the window) + «حافظه…» + the file item; the icon shows brain + word
+  count while the memory recorder runs. The bare-Space monitor requires the MAIN window to
+  be key (a focused memory/settings window used to start recordings on Space).
 - LLM/API failure (after the one 429 retry) → the raw text becomes the result (clean_all then carries `"fallback":true`);
   the recording is unaffected. The clipboard is written exactly once per recording (at finish),
   never mid-recording.
@@ -125,8 +164,10 @@ the fallback is a real copy into /Applications after each build.
   turns them back (دیپلوی → deploy); settled loanwords (فایل، سرور) stay Persian.
 - TextIteratorStreamer holds the last word until the next one — already handled in server.py.
 - Every recording terminates in exactly one of `clean_all` / `clean_state off` / `error`;
-  the app holds `.finalizing` (Record disabled) until it — up to the 15 s LLM timeout — so a
-  restart can never land mid-clean on the wrong card. Pinned by test_final_clean.py.
+  the main flow holds `.finalizing` (Record disabled) until it — up to the 15 s LLM
+  timeout — so a restart can never land mid-clean on the wrong card. Pinned by
+  test_final_clean.py. Memory-mode recordings resolve the same trio without a card: the
+  bar shows «در حال ذخیره…» until `memory_saved` (or failed) lands.
 - The mid-speech cut system (stage 2, incl. locked-clean context chaining) was REMOVED
   2026-11-10: cuts landed mid-word, every pause overwrote the clipboard, and the 3 s/4 s
   cut–stop coupling ended recordings on thinking pauses. `clean()`'s context param stays
