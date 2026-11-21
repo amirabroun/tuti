@@ -32,7 +32,7 @@ struct Card: Identifiable {
     var intent: DictationAction?  // a parsed voice command, run only when its chip is clicked
     var intentDone = false
     var fallback = false  // the LLM pass returned nothing: text is raw, the retry chip shows
-    var mode: String?  // the recording's LLM pass ("message" / nil = clean), resent on retry
+    var mode: String?  // the recording's LLM pass ("message"; nil = pre-2026-11-18 clean-era card), resent on retry
     var memorySaved = false  // the server merged this recording into the memory file (passive chip)
 
     init(id: UUID = UUID(), ts: String, text: String = "", raw: String? = nil, isFinal: Bool = false,
@@ -58,13 +58,13 @@ struct ChatTurn: Identifiable {
     let text: String
 }
 
+/// The main window's sidebar tabs; bare Space records only on .clipboard.
+enum MainTab: Hashable { case clipboard, memory, settings }
+
 /// App state: drives the server process, the socket and the mic; the window renders it.
 @MainActor @Observable
 final class TranscriptViewModel {
     enum Phase { case starting, ready, recording, finalizing }
-
-    /// With autoStop on, silence this long (since the last new text) ends the recording.
-    let stopAfter: TimeInterval = 4
 
     private(set) var phase = Phase.starting
     private(set) var cards: [Card] = []  // one card per recording; the last non-final one is live
@@ -103,11 +103,8 @@ final class TranscriptViewModel {
     private(set) var chatPending = false
     private(set) var chatFailed = false
     var searchQuery = ""
-    var autoStop: Bool { didSet { UserDefaults.standard.set(autoStop, forKey: "autoStop") } }
-    /// ON = this recording's LLM pass rewrites the transcript as one clean, flowing
-    /// message (server mode "message") instead of a plain clean. Sticky like autoStop;
-    /// read at Record.
-    var messageMode: Bool { didSet { UserDefaults.standard.set(messageMode, forKey: "messageMode") } }
+    /// The sidebar's selected tab; the Space monitor reads it (see appStart).
+    var selectedTab: MainTab = .clipboard
 
     var visibleCards: [Card] {
         guard !searchQuery.isEmpty else { return cards }
@@ -136,7 +133,6 @@ final class TranscriptViewModel {
     private let socket = WSClient()
     private let mic = MicStreamer()
     private var started = false
-    private var autoStopTask: Task<Void, Never>?
     private var finalRaw: String?  // asr_final's raw text, saved to history once its clean resolves
     private var hotkey: HotkeyCenter?
     private var spaceMonitor: Any?
@@ -145,12 +141,6 @@ final class TranscriptViewModel {
     private var memoryWatch: DispatchSourceFileSystemObject?
     /// The app that was frontmost when ⌥Space started the recording; the result pastes back into it.
     private var pasteTarget: NSRunningApplication?
-
-    init() {
-        let d = UserDefaults.standard
-        autoStop = (d.object(forKey: "autoStop") as? Bool) ?? true
-        messageMode = (d.object(forKey: "messageMode") as? Bool) ?? false
-    }
 
     func appStart() {
         guard !started else { return }
@@ -176,14 +166,15 @@ final class TranscriptViewModel {
         hotkey = HotkeyCenter()
         hotkey?.onToggle = { [weak self] in Task { @MainActor in self?.hotkeyToggleRecord() } }
         hotkey?.start()
-        // Space toggles Record — claimed only when nothing else has focus: a text view
-        // first responder (the search field) keeps its spaces.
+        // Space toggles Record — claimed only on the clipboard tab with nothing else in
+        // focus: a text view first responder (search field, memory chat) keeps its spaces.
         spaceMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             MainActor.assumeIsolated {
                 guard let self,
                       event.charactersIgnoringModifiers == " ",
                       event.modifierFlags.intersection([.command, .option, .control, .shift, .function]).isEmpty,
                       !event.isARepeat,
+                      self.selectedTab == .clipboard,
                       let window = NSApp.keyWindow, window.firstResponder === window,
                       self.mainWindow == nil || window === self.mainWindow else { return event }
                 self.toggleRecord()
@@ -231,16 +222,12 @@ final class TranscriptViewModel {
             partial = ""
             finalRaw = nil
             copied = false
-            let mode = messageMode ? "message" : nil
-            cards.append(Card(ts: stamp(), mode: mode))
-            var start: [String: Any] = ["v": 1, "type": "control", "action": "start",
-                                        "sample_rate": mic.sampleRate]
-            if let mode { start["mode"] = mode }  // absent = clean (old servers ignore it)
-            socket.send(start)
+            // message mode is the only mode — the «پیام» toggle was removed 2026-11-21
+            cards.append(Card(ts: stamp(), mode: "message"))
+            socket.send(["v": 1, "type": "control", "action": "start",
+                         "sample_rate": mic.sampleRate, "mode": "message"])
             phase = .recording
-            scheduleAutoStop()
         case .recording:
-            autoStopTask?.cancel()
             mic.stop()
             socket.send(["v": 1, "type": "control", "action": "stop"])
             phase = .finalizing
@@ -287,7 +274,6 @@ final class TranscriptViewModel {
     /// straight into the memory file (mode "memory") and the bar shows the save state.
     func toggleMemoryRecord() {
         if memoryActive {
-            autoStopTask?.cancel()
             mic.stop()
             socket.send(["v": 1, "type": "control", "action": "stop"])
             memorySave = .saving
@@ -306,7 +292,6 @@ final class TranscriptViewModel {
         socket.send(["v": 1, "type": "control", "action": "start",
                      "sample_rate": mic.sampleRate, "mode": "memory"])
         memoryActive = true
-        scheduleAutoStop()
     }
 
     /// The bar's save state is transient feedback («حفظ شد» lingers ~4 s, then clears).
@@ -332,14 +317,14 @@ final class TranscriptViewModel {
     }
 
     /// The «تلاش دوباره» chip on a fallback card: re-run the LLM pass on that recording's
-    /// raw text, in the mode it was recorded in (old cards take the current toggle). The
-    /// clipboard is not touched — the card click that follows copies.
+    /// raw text, in the mode it was recorded in (pre-toggle cards take message — the only
+    /// mode now). The clipboard is not touched — the card click that follows copies.
     func retryClean(_ id: UUID) {
         guard let idx = cards.firstIndex(where: { $0.id == id }),
               let raw = cards[idx].raw, !raw.isEmpty, !retryingIds.contains(id) else { return }
         retryingIds.insert(id)
         socket.send(["v": 1, "type": "retry", "id": id.uuidString, "text": raw,
-                     "mode": cards[idx].mode ?? (messageMode ? "message" : "clean")])
+                     "mode": cards[idx].mode ?? "message"])
     }
 
     /// The «چینش با AI» ask: one LLM call on the server with the whole memory file; the
@@ -416,26 +401,12 @@ final class TranscriptViewModel {
         }
     }
 
-    /// Restart the no-new-text timer on every partial (either recorder). When it fires
-    /// (autoStop on): the active recording ends by the Stop path — the one clean/merge
-    /// happens after stop, not here.
-    private func scheduleAutoStop() {
-        autoStopTask?.cancel()
-        guard phase == .recording || memoryActive, autoStop else { return }
-        autoStopTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(self?.stopAfter ?? 4))
-            guard let self, !Task.isCancelled else { return }
-            if self.memoryActive { self.toggleMemoryRecord() } else { self.toggleRecord() }
-        }
-    }
-
     private func connectionChanged(_ connected: Bool) {
         if connected {
             lastError = ""
             phase = .ready
         } else {
             mic.stop()
-            autoStopTask?.cancel()
             planFailed = planPending  // an in-flight ask can no longer be answered
             planPending = false
             chatFailed = chatPending
@@ -452,11 +423,9 @@ final class TranscriptViewModel {
         case "asr_partial":
             if memoryActive {
                 memoryPartial = message["text"] as? String ?? memoryPartial
-                scheduleAutoStop()
                 return
             }
             partial = message["text"] as? String ?? partial
-            scheduleAutoStop()
         case "clean_state":
             cleaning = message["on"] as? Bool ?? false
             if !cleaning, let raw = finalRaw {  // no clean is coming: the raw text is final
@@ -551,7 +520,6 @@ final class TranscriptViewModel {
                 // «در حال ذخیره…»; no card, no history, main phase untouched
                 memoryActive = false
                 memoryPartial = ""
-                autoStopTask?.cancel()
                 mic.stop()  // the server can end a recording itself (idle timeout)
                 memorySave = (message["text"] as? String ?? "").isEmpty ? .none : .saving
                 return
@@ -559,7 +527,6 @@ final class TranscriptViewModel {
             // terminator: the one clean (clean_all, or clean_state off) may still arrive
             finalRaw = message["text"] as? String
             partial = ""
-            autoStopTask?.cancel()
             mic.stop()  // the server can end a recording itself (idle timeout); a live tap would crash the next start
             if dropDeletedRecording() { return }
             if let last = cards.last, !last.isFinal, last.text.isEmpty, finalRaw?.isEmpty != false {
@@ -572,7 +539,6 @@ final class TranscriptViewModel {
         case "error":
             lastError = message["message"] as? String ?? "Unknown error"
             partial = ""
-            autoStopTask?.cancel()
             mic.stop()
             pasteTarget = nil
             if memoryActive {
@@ -698,7 +664,6 @@ final class TranscriptViewModel {
     }
 
     private func shutdown() {
-        autoStopTask?.cancel()
         memorySaveClearTask?.cancel()
         if let spaceMonitor { NSEvent.removeMonitor(spaceMonitor) }
         memoryWatch?.cancel()

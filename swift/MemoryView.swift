@@ -93,7 +93,6 @@ struct MemoryPanelView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
-                        Text("حافظه").font(.title3.bold())
                         Spacer()
                         Button {
                             model.reloadMemory()
