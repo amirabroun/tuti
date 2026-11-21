@@ -48,6 +48,16 @@ struct Card: Identifiable {
     }
 }
 
+/// The «افزودن به حافظه» bar's save state: the merge outcome after a memory recording.
+enum MemorySaveState { case none, saving, saved, unchanged, failed }
+
+/// One message of the memory window's chat thread (his message or the AI's reply).
+struct ChatTurn: Identifiable {
+    let id = UUID()
+    let isAI: Bool
+    let text: String
+}
+
 /// App state: drives the server process, the socket and the mic; the window renders it.
 @MainActor @Observable
 final class TranscriptViewModel {
@@ -74,6 +84,24 @@ final class TranscriptViewModel {
     private(set) var llmModel = ""   // the config the server actually loaded (Settings panel);
     private(set) var llmBaseURL = "" // the key itself never leaves the server process
     private(set) var llmClean = false
+    // the memory file, re-read for the panel and the menu bar (MemoryView.swift renders it)
+    private(set) var memoryExists = true
+    private(set) var memoryTasks: [MemoryTask] = []
+    private(set) var memoryFacts: [String] = []
+    // the «چینش با AI» ask: one server LLM call, answered by "memory_plan_result"
+    private(set) var planPending = false
+    private(set) var planText: String?
+    private(set) var planFailed = false
+    // The «افزودن به حافظه» bar's own recorder — deliberately separate from the main
+    // cards/clipboard flow: no card is created, phase stays .ready, the bar itself shows
+    // the live partial and the merge's save state.
+    private(set) var memoryActive = false
+    private(set) var memoryPartial = ""
+    private(set) var memorySave: MemorySaveState = .none
+    // The memory window's chat with the AI ("memory_chat" → "memory_chat_result").
+    private(set) var chatTurns: [ChatTurn] = []
+    private(set) var chatPending = false
+    private(set) var chatFailed = false
     var searchQuery = ""
     var autoStop: Bool { didSet { UserDefaults.standard.set(autoStop, forKey: "autoStop") } }
     /// ON = this recording's LLM pass rewrites the transcript as one clean, flowing
@@ -91,6 +119,9 @@ final class TranscriptViewModel {
 
     /// Words heard so far — the menu bar's live "it is following me" signal.
     var wordCount: Int { partial.split(whereSeparator: \.isWhitespace).count }
+
+    /// Same for the memory window's recorder (the menu bar shows it while it runs).
+    var memoryWordCount: Int { memoryPartial.split(whereSeparator: \.isWhitespace).count }
 
     var statusText: String {
         switch phase {
@@ -110,6 +141,8 @@ final class TranscriptViewModel {
     private var hotkey: HotkeyCenter?
     private var spaceMonitor: Any?
     private var pasteTask: Task<Void, Never>?
+    /// Watches the memory folder so a merge lands in the panel/menu bar without a refresh.
+    private var memoryWatch: DispatchSourceFileSystemObject?
     /// The app that was frontmost when ⌥Space started the recording; the result pastes back into it.
     private var pasteTarget: NSRunningApplication?
 
@@ -151,13 +184,15 @@ final class TranscriptViewModel {
                       event.charactersIgnoringModifiers == " ",
                       event.modifierFlags.intersection([.command, .option, .control, .shift, .function]).isEmpty,
                       !event.isARepeat,
-                      let window = NSApp.keyWindow, window.firstResponder === window else { return event }
+                      let window = NSApp.keyWindow, window.firstResponder === window,
+                      self.mainWindow == nil || window === self.mainWindow else { return event }
                 self.toggleRecord()
                 return nil
             }
         }
         sidecar.start()
         socket.connect()
+        reloadMemory()
     }
 
     /// Record/Stop button or Space, inside the window: the result stays a card, nothing is pasted.
@@ -168,6 +203,7 @@ final class TranscriptViewModel {
 
     /// ⌥Space from any app: remember where the result should paste back when it's done.
     func hotkeyToggleRecord() {
+        guard !memoryActive else { return }  // the memory window's recorder owns the mic
         if phase == .recording {
             toggleRecord()
         } else if phase == .ready {
@@ -179,9 +215,12 @@ final class TranscriptViewModel {
         }
     }
 
+    /// Record/Stop for the main window's cards flow (the memory window has its own
+    /// recorder below — one mic, so the two refuse to run at the same time).
     func toggleRecord() {
         switch phase {
         case .ready:
+            guard !memoryActive else { return }
             do {
                 try mic.start()
             } catch {
@@ -192,10 +231,11 @@ final class TranscriptViewModel {
             partial = ""
             finalRaw = nil
             copied = false
-            cards.append(Card(ts: stamp(), mode: messageMode ? "message" : nil))
+            let mode = messageMode ? "message" : nil
+            cards.append(Card(ts: stamp(), mode: mode))
             var start: [String: Any] = ["v": 1, "type": "control", "action": "start",
                                         "sample_rate": mic.sampleRate]
-            if messageMode { start["mode"] = "message" }  // absent = clean (old servers ignore it)
+            if let mode { start["mode"] = mode }  // absent = clean (old servers ignore it)
             socket.send(start)
             phase = .recording
             scheduleAutoStop()
@@ -242,6 +282,55 @@ final class TranscriptViewModel {
         }
     }
 
+    /// The «افزودن به حافظه» bar: its own recorder, fully separate from the main cards
+    /// flow — no card, no clipboard, no phase change; stopping merges the transcript
+    /// straight into the memory file (mode "memory") and the bar shows the save state.
+    func toggleMemoryRecord() {
+        if memoryActive {
+            autoStopTask?.cancel()
+            mic.stop()
+            socket.send(["v": 1, "type": "control", "action": "stop"])
+            memorySave = .saving
+            return
+        }
+        guard phase == .ready else { return }  // the main flow owns the mic
+        do {
+            try mic.start()
+        } catch {
+            lastError = "Microphone: \(error.localizedDescription)"
+            return
+        }
+        lastError = ""
+        memoryPartial = ""
+        memorySave = .none
+        socket.send(["v": 1, "type": "control", "action": "start",
+                     "sample_rate": mic.sampleRate, "mode": "memory"])
+        memoryActive = true
+        scheduleAutoStop()
+    }
+
+    /// The bar's save state is transient feedback («حفظ شد» lingers ~4 s, then clears).
+    private var memorySaveClearTask: Task<Void, Never>?
+
+    private func scheduleMemorySaveClear() {
+        memorySaveClearTask?.cancel()
+        memorySaveClearTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(4))
+            guard let self, !Task.isCancelled, self.memorySave != .saving else { return }
+            self.memorySave = .none
+        }
+    }
+
+    /// The main window, for the Space monitor: a bare Space must toggle Record only when
+    /// THIS window is key — the memory/settings windows would start recordings otherwise.
+    @ObservationIgnored weak var mainWindow: NSWindow?
+
+    /// Called from ContentView.onAppear; the title is the stable handle (SwiftUI sets
+    /// NSWindow.title from the scene title, so keyWindow timing never matters here).
+    func captureMainWindow() {
+        mainWindow = NSApp.windows.first { $0.title == "Tuti" }
+    }
+
     /// The «تلاش دوباره» chip on a fallback card: re-run the LLM pass on that recording's
     /// raw text, in the mode it was recorded in (old cards take the current toggle). The
     /// clipboard is not touched — the card click that follows copies.
@@ -251,6 +340,65 @@ final class TranscriptViewModel {
         retryingIds.insert(id)
         socket.send(["v": 1, "type": "retry", "id": id.uuidString, "text": raw,
                      "mode": cards[idx].mode ?? (messageMode ? "message" : "clean")])
+    }
+
+    /// The «چینش با AI» ask: one LLM call on the server with the whole memory file; the
+    /// reply replaces any previous plan text. The question is optional ("" = the prompt's
+    /// default order: simple first, soonest deadline first).
+    func askPlan(_ question: String) {
+        guard !planPending else { return }
+        planPending = true
+        planFailed = false
+        planText = nil
+        socket.send(["v": 1, "type": "memory_plan", "text": question])
+    }
+
+    /// One message to the memory window's AI chat: the recent thread rides along (last 8
+    /// turns) so a follow-up like «اسمش رو عوض کن» has its context. One server LLM call;
+    /// the model may rewrite the memory file (the answer carries "changed").
+    func sendChat(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !chatPending, phase == .ready, !memoryActive else { return }
+        chatTurns.append(ChatTurn(isAI: false, text: trimmed))
+        chatPending = true
+        chatFailed = false
+        let turns = chatTurns.dropLast().suffix(8).map { ["who": $0.isAI ? "ai" : "me", "text": $0.text] }
+        socket.send(["v": 1, "type": "memory_chat", "text": trimmed, "turns": turns])
+    }
+
+    /// Clears the session's chat thread (the server's memory_log.jsonl keeps everything).
+    func clearChat() {
+        guard !chatPending else { return }
+        chatTurns = []
+        chatFailed = false
+    }
+
+    /// Open tasks, soonest date first (undated last) — the menu bar's next-3 list.
+    var openMemoryTasks: [MemoryTask] {
+        memoryTasks.filter { !$0.done }.sorted { ($0.date ?? "9999-99-99") < ($1.date ?? "9999-99-99") }
+    }
+
+    /// Re-reads the memory file for the panel and menu bar; also starts the directory
+    /// watcher the first time — the merge writes via os.replace (a new inode), so only
+    /// watching the folder catches every save.
+    func reloadMemory() {
+        if memoryWatch == nil { watchMemoryFile() }
+        memoryExists = FileManager.default.fileExists(atPath: Config.memoryURL.path)
+        let f = MemoryFile.load()
+        memoryTasks = f.tasks
+        memoryFacts = f.facts
+    }
+
+    private func watchMemoryFile() {
+        let dir = Config.memoryURL.deletingLastPathComponent().path
+        let fd = open(dir, O_EVTONLY)
+        guard fd >= 0 else { return }  // no folder yet: the first save creates it, retry then
+        let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: .write,
+                                                            queue: .main)
+        src.setEventHandler { [weak self] in self?.reloadMemory() }
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        memoryWatch = src
     }
 
     /// Runs a card's parsed voice command (stage 3): the chip was clicked. The osascript can
@@ -268,15 +416,16 @@ final class TranscriptViewModel {
         }
     }
 
-    /// Restart the no-new-text timer on every partial. When it fires (autoStop on): the
-    /// recording ends by the Stop path — the one clean happens after stop, not here.
+    /// Restart the no-new-text timer on every partial (either recorder). When it fires
+    /// (autoStop on): the active recording ends by the Stop path — the one clean/merge
+    /// happens after stop, not here.
     private func scheduleAutoStop() {
         autoStopTask?.cancel()
-        guard phase == .recording, autoStop else { return }
+        guard phase == .recording || memoryActive, autoStop else { return }
         autoStopTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(self?.stopAfter ?? 4))
-            guard let self, !Task.isCancelled, self.phase == .recording else { return }
-            self.toggleRecord()
+            guard let self, !Task.isCancelled else { return }
+            if self.memoryActive { self.toggleMemoryRecord() } else { self.toggleRecord() }
         }
     }
 
@@ -287,6 +436,13 @@ final class TranscriptViewModel {
         } else {
             mic.stop()
             autoStopTask?.cancel()
+            planFailed = planPending  // an in-flight ask can no longer be answered
+            planPending = false
+            chatFailed = chatPending
+            chatPending = false
+            memoryActive = false  // a merge in flight can no longer report back
+            memoryPartial = ""
+            memorySave = .none
             phase = .starting
         }
     }
@@ -294,6 +450,11 @@ final class TranscriptViewModel {
     private func handle(_ message: [String: Any]) {
         switch message["type"] as? String {
         case "asr_partial":
+            if memoryActive {
+                memoryPartial = message["text"] as? String ?? memoryPartial
+                scheduleAutoStop()
+                return
+            }
             partial = message["text"] as? String ?? partial
             scheduleAutoStop()
         case "clean_state":
@@ -354,14 +515,47 @@ final class TranscriptViewModel {
                 cards[idx].intentDone = false
             }
         case "memory_saved":
-            // the server merged the just-finished recording into the memory file. The chip
-            // is pure notification — nothing to click, nothing runs. Same last-final-card
-            // rule as intent (a card deleted mid-flight can drop the flag onto none).
-            if let idx = cards.lastIndex(where: { $0.isFinal }) {
-                cards[idx].memorySaved = true
-                updateHistory(cards[idx]) { $0.memory = true }
+            // the merge outcome for the «افزودن به حافظه» bar (no card anymore; old
+            // history lines still show the card chip via loadHistory). unchanged = the
+            // model judged the file already covers the speech; failed = nothing landed.
+            if message["failed"] as? Bool == true {
+                memorySave = .failed
+            } else if message["unchanged"] as? Bool == true {
+                memorySave = .unchanged
+            } else {
+                memorySave = .saved
+                reloadMemory()  // the panel and menu bar show the new content right away
+            }
+            scheduleMemorySaveClear()
+        case "memory_plan_result":
+            // the «چینش با AI» answer for the memory panel
+            planPending = false
+            if let text = message["text"] as? String, !(message["failed"] as? Bool ?? false) {
+                planText = text
+            } else {
+                planFailed = true
+            }
+        case "memory_chat_result":
+            // the memory chat's reply; changed = the memory file was rewritten on disk
+            chatPending = false
+            if let text = message["text"] as? String, !(message["failed"] as? Bool ?? false),
+               !text.isEmpty {
+                chatTurns.append(ChatTurn(isAI: true, text: text))
+                if message["changed"] as? Bool == true { reloadMemory() }
+            } else {
+                chatFailed = true
             }
         case "asr_final":
+            if memoryActive {
+                // the memory recorder's terminator: the merge follows, the bar shows
+                // «در حال ذخیره…»; no card, no history, main phase untouched
+                memoryActive = false
+                memoryPartial = ""
+                autoStopTask?.cancel()
+                mic.stop()  // the server can end a recording itself (idle timeout)
+                memorySave = (message["text"] as? String ?? "").isEmpty ? .none : .saving
+                return
+            }
             // terminator: the one clean (clean_all, or clean_state off) may still arrive
             finalRaw = message["text"] as? String
             partial = ""
@@ -381,6 +575,12 @@ final class TranscriptViewModel {
             autoStopTask?.cancel()
             mic.stop()
             pasteTarget = nil
+            if memoryActive {
+                memoryActive = false
+                memoryPartial = ""
+                memorySave = .failed
+                return
+            }
             if phase == .recording || phase == .finalizing { phase = .ready }
             if let last = cards.last, !last.isFinal {
                 if last.text.isEmpty { cards.removeLast() } else { updateLastCard { $0.isFinal = true } }
@@ -403,8 +603,9 @@ final class TranscriptViewModel {
         return false
     }
 
-    /// One place where a recording resolves: paragraph the display text, save history,
-    /// copy, and paste back if the recording came from the hotkey.
+    /// One place where a main-flow recording resolves: paragraph the display text, save
+    /// history, copy, and paste back if the recording came from the hotkey. Memory
+    /// recordings never reach here — their product is the memory file, not a card.
     private func finishCard(raw: String, clean: String?) {
         let text = paragraphs(clean ?? raw)
         updateLastCard { $0.text = text; $0.raw = raw; $0.isFinal = true }
@@ -498,7 +699,9 @@ final class TranscriptViewModel {
 
     private func shutdown() {
         autoStopTask?.cancel()
+        memorySaveClearTask?.cancel()
         if let spaceMonitor { NSEvent.removeMonitor(spaceMonitor) }
+        memoryWatch?.cancel()
         mic.stop()
         socket.disconnect()
         sidecar.stop()

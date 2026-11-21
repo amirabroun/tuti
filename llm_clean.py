@@ -1,5 +1,5 @@
 """Stage 2/3: LLM calls for tuti — text cleanup, the message mode, voice-command intent,
-and the long-term memory merge.
+the long-term memory merge, the memory panel's task-plan ask and its AI chat.
 
 Two dialects, picked from the base URL:
   OpenAI-compatible chat/completions — TUTI_LLM_BASE_URL e.g. https://api.openai.com/v1
@@ -133,7 +133,8 @@ def _log_call(kind: str, text: str, context: str | None, out: str | None, usage:
 
 def _call(kind: str, prompt_file: str, text: str, context: str | None,
           max_tokens: int = 1024, note: str | None = None,
-          extra: str | None = None) -> tuple[str | None, tuple[int, int]]:
+          extra: str | None = None, model: str | None = None,
+          timeout: float = TIMEOUT) -> tuple[str | None, tuple[int, int]]:
     """One API call with a single retry on 429: (result text or None, (in tokens, out tokens))."""
     start = time.monotonic()
     tries = 0
@@ -143,12 +144,12 @@ def _call(kind: str, prompt_file: str, text: str, context: str | None,
         system = open(os.path.join(_HERE, "prompts", prompt_file)).read()
         if note:
             system += f"\n\n{note}"
-        req = _request(os.environ["TUTI_LLM_BASE_URL"], os.environ["TUTI_LLM_MODEL"],
+        req = _request(os.environ["TUTI_LLM_BASE_URL"], model or os.environ["TUTI_LLM_MODEL"],
                        os.environ["TUTI_LLM_API_KEY"], system, text, context, max_tokens, extra)
         while True:
             tries += 1
             try:
-                with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
                     response = json.load(r)
                 if _truncated(response):
                     raise RuntimeError(f"output truncated at max_tokens={max_tokens}")
@@ -223,5 +224,56 @@ def memory(current_md: str, text: str) -> tuple[str | None, tuple[int, int]]:
         return None, (0, 0)
     # same clock trick as intent(): the model has no idea what «فردا» means without today's date
     today = datetime.now().strftime("%Y-%m-%d (%A)")
+    # the whole file is regenerated per merge: at glm-4.5-air's ~30 out-tokens/s the default
+    # 15 s ceiling breaks in around 400 tokens — a grown file needs its own headroom
     return _call("memory", "memory.md", text, context=None, max_tokens=4000,
-                 extra=f"<m>\n{current_md}\n</m>", note=f"تاریخ امروز: {today}")
+                 extra=f"<m>\n{current_md}\n</m>", note=f"تاریخ امروز: {today}", timeout=60)
+
+
+def plan(memory_md: str, question: str) -> tuple[str | None, tuple[int, int]]:
+    """The memory panel's «چینش با AI»: the whole memory file + an optional question → a
+    short ordered plan for the open tasks (prompts/plan.md). Read-only on the file.
+    TUTI_LLM_PLAN_MODEL overrides the model for this one call — a stronger head than the
+    dictation cleaner is fine here. None = off or failed — the panel shows an error line.
+    """
+    if not configured():
+        return None, (0, 0)
+    today = datetime.now().strftime("%Y-%m-%d (%A)")
+    return _call("plan", "plan.md", question.strip() or "کارهام رو به ترتیبی که باید انجام بگیرم بچین",
+                 context=None, max_tokens=1024, extra=f"<m>\n{memory_md}\n</m>",
+                 note=f"تاریخ امروز: {today}", timeout=60,
+                 model=os.environ.get("TUTI_LLM_PLAN_MODEL") or None)
+
+
+def chat(memory_md: str, turns: list[dict], text: str) -> tuple[str | None, str | None, tuple[int, int]]:
+    """The memory panel's chat with the AI (prompts/chat.md): the file + the recent turns +
+    a new message → (short reply, the whole rewritten file or None, usage).
+
+    The model appends the full new file after ===MEMORY=== … ===END=== only when the
+    message changed something (a save, a rename, a tick, a delete); otherwise the reply
+    stands alone. None reply = off or failed. TUTI_LLM_PLAN_MODEL overrides the model —
+    the same stronger-head reasoning as plan().
+    """
+    if not configured():
+        return None, None, (0, 0)
+    today = datetime.now().strftime("%Y-%m-%d (%A)")
+    hist = "\n".join(f"{'امیر' if t.get('who') == 'me' else 'تو'}: {t.get('text', '')}" for t in turns[-8:])
+    extra = f"<m>\n{memory_md}\n</m>"
+    if hist:
+        extra += f"\n\n<history>\n{hist}\n</history>"
+    out, usage = _call("chat", "chat.md", text, context=None, max_tokens=4000,
+                       extra=extra, note=f"تاریخ امروز: {today}",
+                       model=os.environ.get("TUTI_LLM_PLAN_MODEL") or None, timeout=60)
+    if not out:
+        return None, None, usage
+    reply, marker, rest = out.partition("===MEMORY===")
+    new_file = None
+    if marker:
+        body, _, _ = rest.partition("===END===")
+        body = _unwrap(body.strip())  # a model that fences just the file part must not poison memory.md
+        if body:
+            new_file = body
+    reply = reply.strip()
+    if not reply and new_file:
+        reply = "انجام شد."  # a file-only answer still needs something to show
+    return reply or None, new_file, usage

@@ -12,6 +12,10 @@ enum Config {
         .appendingPathComponent("Library/Logs/tuti/server.log")
     static let historyURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/tuti/history.jsonl")
+    static let memoryURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Documents/tuti-memory/memory.md")
+    static let memoryLogURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/tuti/memory_log.jsonl")
 }
 
 @main
@@ -30,18 +34,25 @@ struct TutiApp: App {
         MenuBarExtra {
             MenuBarContent(model: model)
         } label: {
-            // the state at a glance, no click: recording (live word count) / AI editing / idle
+            // the state at a glance, no click: recording (live word count) / the memory
+            // window's recorder / AI editing / idle
             HStack(spacing: 4) {
-                switch model.phase {
-                case .recording:
+                if model.phase == .recording {
                     Image(systemName: "mic.fill")
                     Text(verbatim: model.wordCount.formatted(.number.locale(Locale(identifier: "fa_IR"))))
-                case .finalizing:
+                } else if model.memoryActive {
+                    Image(systemName: "brain")
+                    Text(verbatim: model.memoryWordCount.formatted(.number.locale(Locale(identifier: "fa_IR"))))
+                } else if model.phase == .finalizing {
                     Image(systemName: "wand.and.stars")
-                case .starting, .ready:
+                } else {
                     Image(systemName: "waveform")
                 }
             }
+        }
+        // opens only via openWindow (toolbar, menu bar) — never at app launch
+        Window("حافظه", id: "memory") {
+            MemoryPanelView(model: model)
         }
         // opens only via openWindow (first launch, menu bar) — never at app launch
         Window("Settings", id: "settings") {
@@ -58,8 +69,9 @@ private struct MenuBarContent: View {
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     var body: some View {
-        if model.phase == .recording {
-            Text(liveTail).lineLimit(2)  // the last words heard: proof it is following the speech
+        if model.phase == .recording || model.memoryActive {
+            // the last words heard: proof it is following the speech (either recorder)
+            Text(liveTail(model.memoryActive ? model.memoryPartial : model.partial)).lineLimit(2)
             Divider()
         }
         Text(model.statusText)
@@ -70,11 +82,28 @@ private struct MenuBarContent: View {
         Text("tokens: \(model.tokensIn.formatted()) in · \(model.tokensOut.formatted()) out")
         Divider()
         Button(model.phase == .recording ? "Stop" : "Record") { model.uiToggleRecord() }
-            .disabled(model.phase != .ready && model.phase != .recording)
+            .disabled(model.memoryActive || (model.phase != .ready && model.phase != .recording))
         Toggle("پیام", isOn: Bindable(model).messageMode)  // ⌥Space users switch mode without the window
         Divider()
         ForEach(model.cards.filter { $0.isFinal }.suffix(5).reversed()) { card in
             Button(menuTitle(card.text)) { model.copyText(card.text) }
+        }
+        if model.memoryExists {
+            Divider()
+            // the next open tasks (soonest first); a click opens the full «حافظه» window
+            ForEach(model.openMemoryTasks.prefix(3)) { task in
+                Button(menuTaskTitle(task)) {
+                    openWindow(id: "memory")
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+            }
+            Button("حافظه…") {
+                openWindow(id: "memory")
+                NSApp.activate(ignoringOtherApps: true)
+            }
+            Button("باز کردن فایل حافظه") {
+                NSWorkspace.shared.open(Config.memoryURL)
+            }
         }
         Divider()
         Toggle("Launch at Login", isOn: Binding(
@@ -100,9 +129,9 @@ private struct MenuBarContent: View {
             .keyboardShortcut("q")
     }
 
-    /// The last ~60 chars of the raw transcript so far, flat; the freshest proof the mic is followed.
-    private var liveTail: String {
-        let flat = model.partial.replacingOccurrences(of: "\n", with: " ")
+    /// The last ~60 chars of what a recorder has heard, flat; the freshest proof the mic is followed.
+    private func liveTail(_ heard: String) -> String {
+        let flat = heard.replacingOccurrences(of: "\n", with: " ")
             .trimmingCharacters(in: .whitespaces)
         return flat.isEmpty ? "…" : (flat.count > 60 ? "…" + String(flat.suffix(60)) : flat)
     }
@@ -110,6 +139,10 @@ private struct MenuBarContent: View {
     private func menuTitle(_ text: String) -> String {
         let flat = text.replacingOccurrences(of: "\n", with: " ")
         return flat.count > 60 ? String(flat.prefix(60)) + "…" : flat
+    }
+
+    private func menuTaskTitle(_ task: MemoryTask) -> String {
+        menuTitle(task.date.map { $0 + " — " + task.text } ?? task.text)
     }
 }
 
@@ -145,6 +178,14 @@ struct ContentView: View {
                     }
                     .buttonStyle(.borderless)
                 }
+                Button {
+                    openWindow(id: "memory")
+                    NSApp.activate(ignoringOtherApps: true)
+                } label: {
+                    Image(systemName: "brain").foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help("حافظه — کارها و حقایق ذخیره‌شده")
                 Button {
                     openWindow(id: "settings")
                     NSApp.activate(ignoringOtherApps: true)
@@ -206,10 +247,11 @@ struct ContentView: View {
             .controlSize(.large)
             // Space is handled by a key monitor in the model: a bare-Space button shortcut
             // also fires while typing in the search/edit fields (macOS SwiftUI quirk)
-            .disabled(model.phase != .ready && model.phase != .recording)
+            .disabled(model.memoryActive || (model.phase != .ready && model.phase != .recording))
         }
         .padding()
         .onAppear {
+            model.captureMainWindow()
             // first run only: ask every permission at once, panel on top as the guide
             if permissions.firstLaunchCheck() {
                 openWindow(id: "settings")
